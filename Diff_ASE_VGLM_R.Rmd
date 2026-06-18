@@ -1,0 +1,524 @@
+---
+title: "Diff_ASE_Analysis"
+author: "Muhammad Arsalan Iqbal"
+date: "2025-03-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+knitr::opts_knit$set(root.dir ="Z:/FBNProjectGroups/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/Output")
+```
+
+#### loading required libraries ####
+
+```{r loading libraries }
+
+# Load necessary libraries for differential expression analysis and data manipulation
+
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(VGAM)
+library(stringr)
+library(tidyverse)
+
+```
+
+#####Differential ASE Analysis Using DESeq2####
+
+```{r Differential ASE analysis}
+
+
+# 1. Load data -----------------------------------------------------------
+ase_counts <- read_csv("/home/fb3/iqbal/mnt/winpro/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/Diff_ASE_Analysis/Input/aggregate_Gene_based.csv") %>%
+  mutate(across(matches("_refAllele$|_altAllele$"), ~ na_if(.x, 0)))
+
+meta <- read_csv("/home/fb3/iqbal/mnt/winpro/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/Diff_ASE_Analysis/Input/Metadata_Final.csv",
+                 col_select = c(id, BC, Tissue)) %>%
+  rename(sample = id, Backcross = BC)
+
+# 2. Prepare ASE long data ------------------------------------------------
+ase_long <- ase_counts %>%
+  pivot_longer(
+    cols        = -name,
+    names_to    = c("sample", "allele"),
+    names_sep   = "_",
+    values_to   = "count"
+  ) %>%
+  mutate(
+    allele = if_else(str_detect(allele, "^ref"), "ref", "alt")
+  ) %>%
+  group_by(name, sample) %>%
+  summarise(
+    ref   = count[allele == "ref"],
+    alt   = count[allele == "alt"],
+    total = ref + alt,
+    .groups = "drop"
+  ) %>%
+  filter(total > 0) %>%
+  left_join(meta, by = "sample")
+
+# 3. Set up tissues and results container ---------------------------------
+
+input_dir <- "/home/fb3/iqbal/mnt/winpro/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/Diff_ASE_Analysis/Input"
+tissues   <- c("Brain", "Liver", "Kidney", "Muscle", "Ovary", "Testis")
+res_list  <- list()
+
+# 4. Loop over tissues ----------------------------------------------------
+for (t in tissues) {
+  # Build full paths to the two gene‐list CSVs:
+  gl_path <- file.path(input_dir, paste0(t, "_F1_GL.csv"))
+  pi_path <- file.path(input_dir, paste0(t, "_F1_Pi.csv"))
+  
+  gl_genes <- read_csv(gl_path, col_names = "name")$name
+  pi_genes <- read_csv(pi_path, col_names = "name")$name
+  genes_to_keep <- union(gl_genes, pi_genes)
+  
+  # 4b. Subset ASE data to tissue & those genes
+  dat_t <- ase_long %>%
+    filter(Tissue == t, name %in% genes_to_keep)
+  
+  # 4c. Set tissue‐specific filtering thresholds
+  if (t == "Ovary") {
+    minGL <- 5;  minPi <- 5
+  } else if (t == "Testis") {
+    minGL <- 5;  minPi <- 4
+  } else {
+    minGL <- 7;  minPi <- 7
+  }
+  
+  # 4d. For each gene, require at least minGL GL‐samples and minPi Pi‐samples
+  res_t <- dat_t %>%
+    group_by(name) %>%
+    filter(
+      sum(!is.na(ref) & Backcross == "F1 * GL") >= minGL,
+      sum(!is.na(ref) & Backcross == "F1 * Pi") >= minPi
+    ) %>%
+    group_split()
+  
+  # 4e. Fit beta‐binomial per gene and collect stats
+  res_df <- map_dfr(res_t, function(gdat) {
+    gene_id <- gdat$name[1]
+    tryCatch({
+      gdat$BC <- factor(gdat$Backcross)
+      fit <- vglm(cbind(ref, alt) ~ BC, betabinomial, data = gdat)
+      coefs <- coef(summary(fit))
+      
+      # p‐value for the Pi vs. GL effect
+      pval <- coefs["BCF1 * Pi", "Pr(>|z|)"]
+      
+      # mean ref‐ratio in each group
+      mean_GL <- mean(gdat$ref[gdat$Backcross=="F1 * GL"] /
+                        (gdat$ref[gdat$Backcross=="F1 * GL"] + gdat$alt[gdat$Backcross=="F1 * GL"]),
+                      na.rm=TRUE)
+      mean_Pi <- mean(gdat$ref[gdat$Backcross=="F1 * Pi"] /
+                        (gdat$ref[gdat$Backcross=="F1 * Pi"] + gdat$alt[gdat$Backcross=="F1 * Pi"]),
+                      na.rm=TRUE)
+      
+      log2FC <- log2((mean_GL + 1e-3)/(mean_Pi + 1e-3))
+      
+      tibble(
+        Tissue   = t,
+        name     = gene_id,
+        mean_GL  = mean_GL,
+        mean_Pi  = mean_Pi,
+        log2FC   = log2FC,
+        pval     = pval
+      )
+    }, error = function(e) NULL)
+  })
+  
+  # 4f. Multiple‐test correction and flag significant
+  res_df <- res_df %>%
+    mutate(
+      padj      = p.adjust(pval, method = "BH"),
+      negLog10P = -log10(padj),
+      sig       = padj < 0.05 & abs(log2FC) > log2(1.1)
+    )
+  
+  # 4g. Keep only significant hits (and sort)
+  res_list[[t]] <- res_df %>%
+    filter(sig) %>%
+    arrange(padj)
+}
+
+output_dir <- "/home/fb3/iqbal/mnt/winpro/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/Diff_ASE_Analysis/Output"
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# 2. Write out one CSV per tissue
+library(purrr)
+library(readr)
+
+walk2(
+  res_list,                    # list of tibbles
+  names(res_list),             # "Brain", "Liver", ...
+  ~ write_csv(
+    .x,
+    file.path(output_dir, paste0(.y, "_Differential_ASE.csv"))
+  )
+)
+
+# ─────────
+
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Setup & libraries
+# ──────────────────────────────────────────────────────────────────────────
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(pheatmap)
+library(grid)
+library(patchwork)  # for layout and auto-labels
+library(tibble)
+
+results_dir <- "/home/fb3/iqbal/mnt/winpro/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/Diff_ASE_Analysis/Output"
+
+# Tissues to include
+heatmap_tissues <- c("Kidney", "Brain", "Ovary", "Liver", "Muscle", "Testis")
+
+# Helper to read mean ratios
+read_mat <- function(t) {
+  df <- read_csv(file.path(results_dir, paste0(t, "_Differential_ASE.csv")))
+  mat <- df %>%
+    select(name, mean_GL, mean_Pi) %>%
+    column_to_rownames("name") %>%
+    as.matrix()
+  colnames(mat) <- c("F1_GL", "F1_Pi")
+  mat
+}
+
+# Generate heatmap plots wrapped for patchwork
+heatmap_wrapped <- lapply(heatmap_tissues, function(t) {
+  mat <- read_mat(t)
+  p <- pheatmap(
+    mat,
+    color           = heat.colors(50),
+    main            = t,
+    display_numbers = TRUE,
+    number_format   = "%.2f",
+    cluster_rows    = FALSE,
+    cluster_cols    = FALSE,
+    silent          = TRUE,
+    fontsize        = 8,
+    cellwidth       = 30,
+    cellheight      = 25
+  )
+  wrap_elements(p$gtable)
+})
+
+# Combine into 2 columns with A-F labels
+combined_plot <- wrap_plots(heatmap_wrapped) +
+  plot_layout(ncol = 2) +
+  plot_annotation(
+    title = "Mean Ref-Allele Ratios (F1_GL vs F1_Pi)",
+    theme = theme(plot.title = element_text(size = 16, face = "bold")),
+    tag_levels = "A"
+  )
+
+# Save to PDF
+ggsave(file.path(results_dir, "Combined_Heatmaps_AtoF.pdf"), combined_plot,
+       width = 14, height = 12)
+
+# Show on screen
+print(combined_plot)
+
+# ──────────────────────────────────────────────────────────────────────────
+# B) BOXPLOTS: Testis, Muscle, Liver (top 6 genes by |log2FC|)
+# ──────────────────────────────────────────────────────────────────────────
+
+# Ensure ase_long is in your workspace
+
+boxplot_tissues <- c("Kidney","Brain", "Ovary", "Liver", "Muscle", "Testis")
+
+for (t in boxplot_tissues) {
+  # 1. Read the differential ASE results
+  df <- read_csv(file.path(results_dir, paste0(t, "_Differential_ASE.csv")))
+  
+  # 2. Get the full list of significant genes
+  sig_genes <- df %>% pull(name)
+  
+  # 3. Extract per-sample ratios for all sig genes
+  plot_df <- ase_long %>%
+    filter(Tissue == t, name %in% sig_genes) %>%
+    mutate(ratio = ref / (ref + alt))
+  
+  # 4. Draw and save boxplot (one facet per gene)
+  pdf(file.path(results_dir, paste0("boxplot_", t, "_all_sig.pdf")),
+      width = 12, height = 8)
+  print(
+    ggplot(plot_df, aes(x = Backcross, y = ratio, fill = Backcross)) +
+      geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+      geom_jitter(width = 0.2, size = 1, alpha = 0.6) +
+      facet_wrap(~ name, scales = "free_y", ncol = 4) +   # adjust ncol as needed
+      labs(
+        title = paste0("All Significant ASE Genes in ", t),
+        x     = "Backcross",
+        y     = "Reference‐allele ratio"
+      ) +
+      scale_fill_manual(values = c("F1 * GL" = "red", "F1 * Pi" = "blue")) +
+      theme_minimal() +
+      theme(
+        strip.text      = element_text(face = "bold", size = 8),
+        axis.text.x     = element_text(angle = 45, hjust = 1),
+        legend.position = "none"
+      )
+  )
+  dev.off()
+}
+
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(pheatmap)
+library(grid)
+library(patchwork)
+library(tibble)
+library(tidyr)
+
+results_dir <- "/home/fb3/iqbal/mnt/winpro/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/Diff_ASE_Analysis/Output"
+
+# Tissues to include (order will also apply to barplot)
+heatmap_tissues <- c("Kidney", "Brain", "Ovary", "Liver", "Muscle", "Testis")
+
+# Helper to read mean ratios + padj
+read_mat <- function(t) {
+  df <- read_csv(file.path(results_dir, paste0(t, "_Differential_ASE.csv")),
+                 show_col_types = FALSE)
+  
+  mat <- df %>%
+    select(name, mean_GL, mean_Pi) %>%
+    column_to_rownames("name") %>%
+    as.matrix()
+  colnames(mat) <- c("F1_GL", "F1_Pi")
+  
+  # significance stars
+  stars <- df %>%
+    mutate(sig = case_when(
+      padj < 0.001 ~ "***",
+      padj < 0.01  ~ "**",
+      padj < 0.05  ~ "*",
+      TRUE         ~ ""
+    )) %>%
+    select(name, sig)
+  
+  list(mat = mat, sig = stars)
+}
+
+# Generate heatmaps with red-white-blue and stars
+heatmap_wrapped <- lapply(heatmap_tissues, function(t) {
+  obj <- read_mat(t)
+  mat <- obj$mat
+  stars <- obj$sig
+  
+  # numeric labels with stars
+  num_labels <- matrix(
+    sprintf("%.2f", mat),
+    nrow = nrow(mat),
+    ncol = ncol(mat),
+    dimnames = dimnames(mat)
+  )
+  for (r in rownames(mat)) {
+    sig_symbol <- stars$sig[stars$name == r]
+    if (sig_symbol != "") {
+      num_labels[r, "F1_GL"] <- paste0(num_labels[r, "F1_GL"], sig_symbol)
+      num_labels[r, "F1_Pi"] <- paste0(num_labels[r, "F1_Pi"], sig_symbol)
+    }
+  }
+  
+  p <- pheatmap(
+    mat,
+    color           = colorRampPalette(c("blue", "white", "red"))(100),
+    main            = t,
+    display_numbers = num_labels,
+    cluster_rows    = FALSE,
+    cluster_cols    = FALSE,
+    silent          = TRUE,
+    fontsize        = 8,
+    cellwidth       = 30,
+    cellheight      = 25
+  )
+  wrap_elements(p$gtable)
+})
+
+# ---- Stacked barplot data ----
+bar_df <- tribble(
+  ~Comparison, ~DASEGs, ~`F1×GL > F1×Pi`, ~`F1×GL < F1×Pi`,
+  "Liver",   8,  3, 5,
+  "Brain",  18, 11, 7,
+  "Muscle",  9,  4, 5,
+  "Kidney", 21, 12, 9,
+  "Testis",  2,  1, 1,
+  "Ovary",  15,  9, 6
+)
+
+bar_df_long <- bar_df %>%
+  pivot_longer(cols = c(`F1×GL > F1×Pi`, `F1×GL < F1×Pi`),
+               names_to = "Direction", values_to = "Count")
+
+bar_df$Comparison <- factor(bar_df$Comparison, levels = heatmap_tissues)
+
+barplot <- ggplot(bar_df_long, aes(x = Comparison, y = Count, fill = Direction)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = Count),
+            position = position_stack(vjust = 0.5), size = 3.5) +
+  geom_text(
+    data = distinct(bar_df, Comparison, DASEGs),
+    aes(x = Comparison, y = DASEGs, label = DASEGs),
+    vjust = -0.4, fontface = "bold", size = 4, inherit.aes = FALSE
+  ) +
+  scale_fill_manual(values = c("F1×GL > F1×Pi" = "red",
+                               "F1×GL < F1×Pi" = "blue")) +
+  labs(y = "Number of genes", x = NULL, title = "Differential ASE genes") +
+  coord_cartesian(ylim = c(0, max(bar_df$DASEGs) * 1.15)) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 20, hjust = 1),
+    legend.position = "top",
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  )
+
+# ---- Combine: barplot + heatmaps ----
+combined_plot <- barplot / (
+  wrap_plots(heatmap_wrapped) +
+    plot_layout(ncol = 2)
+) +
+  plot_annotation(
+    title = "ASE Analysis Summary",
+    theme = theme(plot.title = element_text(size = 16, face = "bold")),
+    tag_levels = "A"
+  )
+
+# Save
+ggsave(file.path(results_dir, "ASE_Barplot_Heatmaps.pdf"),
+       combined_plot, width = 14, height = 16)
+
+# Show
+print(combined_plot)library(readr)
+library(dplyr)
+library(ggplot2)
+library(pheatmap)
+library(grid)
+library(patchwork)
+library(tibble)
+library(tidyr)
+
+results_dir <- "/home/fb3/iqbal/mnt/winpro/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/Diff_ASE_Analysis/Output"
+
+# -----------------------------
+# 1. STACKED BARPLOT
+# -----------------------------
+
+bar_df <- tribble(
+  ~Comparison, ~DASEGs, ~`F1×GL > F1×Pi`, ~`F1×GL < F1×Pi`,
+  "Liver",   8,  3, 5,
+  "Brain",  18, 11, 7,
+  "Muscle",  9,  4, 5,
+  "Kidney", 21, 12, 9,
+  "Testis",  2,  1, 1,
+  "Ovary",  15,  9, 6
+)
+
+bar_df_long <- bar_df %>%
+  pivot_longer(cols = c(`F1×GL > F1×Pi`, `F1×GL < F1×Pi`),
+               names_to = "Direction", values_to = "Count")
+
+barplot <- ggplot(bar_df_long, aes(x = Comparison, y = Count, fill = Direction)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = Count),
+            position = position_stack(vjust = 0.5), size = 3.5) +
+  geom_text(
+    data = distinct(bar_df, Comparison, DASEGs),
+    aes(x = Comparison, y = DASEGs, label = DASEGs),
+    vjust = -0.4, fontface = "bold", size = 4, inherit.aes = FALSE
+  ) +
+  scale_fill_manual(values = c("F1×GL > F1×Pi" = "red",
+                               "F1×GL < F1×Pi" = "blue")) +
+  labs(y = "Number of genes", x = NULL, title = "Differential ASE genes") +
+  coord_cartesian(ylim = c(0, max(bar_df$DASEGs) * 1.15)) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 20, hjust = 1),
+    legend.position = "top",
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  )
+
+ggsave(file.path(results_dir, "DASEG_StackedBarplot.pdf"),
+       barplot, width = 8, height = 6)
+
+
+# Generate heatmaps
+heatmap_wrapped <- lapply(heatmap_tissues, function(t) {
+  obj <- read_mat(t)
+  mat <- obj$mat
+  stars <- obj$sig
+  
+  # numeric labels with stars
+  num_labels <- matrix(
+    sprintf("%.2f", mat),
+    nrow = nrow(mat),
+    ncol = ncol(mat),
+    dimnames = dimnames(mat)
+  )
+  for (r in rownames(mat)) {
+    sig_symbol <- stars$sig[stars$name == r]
+    if (sig_symbol != "") {
+      num_labels[r, "F1_GL"] <- paste0(num_labels[r, "F1_GL"], sig_symbol)
+      num_labels[r, "F1_Pi"] <- paste0(num_labels[r, "F1_Pi"], sig_symbol)
+    }
+  }
+  
+  p <- pheatmap(
+    mat,
+    color           = colorRampPalette(c("blue", "white", "red"))(100),
+    main            = t,
+    display_numbers = num_labels,
+    cluster_rows    = FALSE,
+    cluster_cols    = FALSE,
+    silent          = TRUE,
+    fontsize        = 8,
+    cellwidth       = 30,
+    cellheight      = 25
+  )
+  wrap_elements(p$gtable)
+})
+
+# Combine heatmaps (2 columns)
+heatmap_plot <- wrap_plots(heatmap_wrapped) +
+  plot_layout(ncol = 2) +
+  plot_annotation(
+    title = "Mean Ref-Allele Ratios (F1_GL vs F1_Pi)",
+    theme = theme(plot.title = element_text(size = 16, face = "bold")),
+    tag_levels = "A"
+  )
+
+ggsave(file.path(results_dir, "ASE_Heatmaps.pdf"),
+       heatmap_plot, width = 14, height = 12)
+
+# Show one of them
+print(barplot)
+print(heatmap_plot)
+
+
+# Combine heatmaps (3 rows × 2 columns)
+heatmap_plot <- wrap_plots(heatmap_wrapped) +
+  plot_layout(ncol = 2, nrow = 3) +
+  plot_annotation(
+    title = "Mean Ref-Allele Ratios (F1_GL vs F1_Pi)",
+    theme = theme(plot.title = element_text(size = 16, face = "bold")),
+    tag_levels = "A"
+  )
+
+ggsave(file.path(results_dir, "ASE_Heatmaps.pdf"),
+       heatmap_plot, width = 14, height = 20)
+
+
+
+```
+
