@@ -1,0 +1,965 @@
+---
+title: "ASE Analysis"
+author: "Muhammad"
+date: "3/19/2025"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+knitr::opts_knit$set(root.dir ="/home/fb3/iqbal/winpro/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/ASEP_Input")
+
+
+```
+## loading required libraries
+
+```{r ASE Analysis}
+
+library(data.table)
+library(readr)
+library(GenomicRanges)
+library(rtracklayer)
+library(dplyr)
+library(stringr)
+library(parallel)
+library(ASEP)        # Ensure this package is installed
+library(npmlreg)     # Required for model fitting in ASEP
+library(ggplot2)     # For plotting later (if needed)
+library(tidyr)
+library(patchwork)   # For combining plots
+library(Rcpp)
+
+
+
+```
+
+### ASE Analysis with ASEreadcount data ###
+
+```{r ASE Analysis}
+# Step 1: Load combined count data
+input_folder <- "/home/fb3/iqbal/winpro/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/round2/5_readcounter"  # Path to .rc.txt files
+files <- list.files(path = input_folder, pattern = "*.rc.txt", full.names = TRUE)
+
+count_tables <- list()
+
+for (file in files) {
+  tryCatch({
+    # Read in count table
+    sample_data <- fread(file, header = TRUE, sep = "\t", fill = TRUE)
+    
+    # Extract sample name from filename
+    sample_name <- gsub(".rc.txt", "", basename(file))
+    
+    # Ensure columns for refCount and altCount are present
+    if ("refCount" %in% colnames(sample_data) && "altCount" %in% colnames(sample_data)) {
+      sample_data <- sample_data %>%
+        mutate(refAllele_col = refCount, altAllele_col = altCount) %>%
+        select(contig, position, refAllele_col, altAllele_col)
+      
+      # Rename columns to reflect the sample name
+      colnames(sample_data)[3:4] <- c(paste0(sample_name, "_refAllele"), paste0(sample_name, "_altAllele"))
+      
+      # Ensure 'position' is an integer column for consistency
+      sample_data$position <- as.integer(sample_data$position)
+      
+      count_tables[[sample_name]] <- sample_data
+    } else {
+      warning(paste("Columns 'refCount' and 'altCount' not found in file:", file))
+    }
+  }, error = function(e) {
+    message(paste("Error reading file:", file))
+    message(e)
+  })
+}
+
+# Now try combining the tables again
+# Now try combining the tables again
+combined_count_table <- Reduce(function(x, y) {
+  merge(x, y, by = c("contig", "position"), all = TRUE)
+}, count_tables)
+
+
+head(combined_count_table)
+
+# Remove any unwanted rows (optional, based on your data)
+combined_count_table <- combined_count_table[-1, ]
+
+# Ensure 'id' column is created as chr__pos for proper merging
+combined_count_table$id <- paste0(combined_count_table$contig, "__", combined_count_table$position)
+
+# Step 2: Get SNP Data (RSID) from VCF
+vcf_file <- "/home/fb3/iqbal/winpro/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/sus_scrofa.vcf.gz"
+snp.db <- fread(cmd = paste("zcat", vcf_file, "| grep -v '#' | cut -f 1-3"))
+
+# Match positions from combined count table to the SNP data
+pos <- match(combined_count_table$id, paste0(snp.db$V1, "__", snp.db$V2), nomatch = 0)
+
+# Add rsID to combined_count_table where positions are found
+combined_count_table[pos > 0, rsID := snp.db$V3[pos]]
+
+# Step 3: Get Gene Annotations from GTF
+gtf.table <- fread("/home/fb3/iqbal/winpro/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/Sus_scrofa.Sscrofa11.1.113.gtf", sep = "\t", header = FALSE)
+
+
+names(gtf.table) <- c("chr", "source", "type", "start", "end", "score", "strand", "phase", "attributes")
+
+# Function to create gene list from GTF
+f_create_gene_list <- function(typE = "gene", gtf.table) {
+  gene.table <- gtf.table[type == typE]
+  gene.table[, `:=`(
+    ensid   = sub('.*gene_id "([^"]+)".*', '\\1', attributes),
+    name    = fifelse(grepl('gene_name "', attributes),
+                      sub('.*gene_name "([^"]+)".*', '\\1', attributes),
+                      NA_character_),
+    biotype = fifelse(grepl('gene_biotype "', attributes),
+                      sub('.*gene_biotype "([^"]+)".*', '\\1', attributes),
+                      NA_character_)
+  )]
+  
+  gene.table[is.na(name), name := ensid]
+  gene.table <- gene.table[, .(chr, type, start, end, biotype, name, ensid)]
+  
+  split(gene.table, gene.table$chr)
+}
+
+# Step 4: Find genes within the GTF and filter for protein-coding genes
+gene.list <- f_create_gene_list("gene", gtf.table[grep("protein_coding", attributes)])
+
+# Convert `ase.pos.list` to expected format
+ase.pos.list <- split(combined_count_table$position, combined_count_table$contig)
+
+unique(combined_count_table$contig)  # Chromosomes in SNP data
+unique(gtf.table$chr) 
+
+# Function to find hits in the GFF region
+f_hit_in_gff_region <- function(gene.list, ase.pos.list) {
+  POS.LIST <- lapply(names(ase.pos.list), function(chr) {
+    genes <- gene.list[[chr]]
+    ase.pos <- ase.pos.list[[chr]]
+    if (is.null(genes)) return(NULL)
+    
+    ASE <- matrix(ase.pos, nrow = length(ase.pos), ncol = nrow(genes))
+    MIN <- matrix(genes$start, nrow = length(ase.pos), ncol = nrow(genes), byrow = TRUE)
+    MAX <- matrix(genes$end, nrow = length(ase.pos), ncol = nrow(genes), byrow = TRUE)
+    POS <- which(ASE >= MIN & ASE <= MAX, arr.ind = TRUE)
+    
+    as.data.table(cbind(ase.pos = ase.pos[POS[, 1]], genes[POS[, 2], ]))
+  })
+  
+  POS.LIST <- POS.LIST[lengths(POS.LIST) > 0]
+  if (length(POS.LIST) == 0) return(data.table())
+  
+  GENE.TABLE <- rbindlist(POS.LIST, fill = TRUE)[, .(
+    chrpos = sprintf("%s__%d", chr, ase.pos),
+    name, ensid, biotype
+  )]
+  
+  do.call(rbind, lapply(split(GENE.TABLE, GENE.TABLE$chrpos), function(X) {
+    if (nrow(X) == 1) return(X)
+    cbind(chrpos = X$chrpos[1], as.data.table(lapply(X[, -1, with = FALSE], paste, collapse = ",")))
+  }))
+}
+
+# Annotate SNP positions with gene information
+coding_hits <- f_hit_in_gff_region(gene.list, ase.pos.list)
+
+# Merge annotated gene data with combined count table
+ANNO.CODING <- merge(
+  combined_count_table[, .(contig, position, rsID, id)], 
+  coding_hits, 
+  by.x = "id", by.y = "chrpos", all.x = TRUE
+)
+
+# Reorder to match the original count table
+ANNO.CODING <- ANNO.CODING[match(combined_count_table$id, ANNO.CODING$id), ]
+
+# View the annotated results
+head(ANNO.CODING)
+
+# Merge the two data frames on 'contig' and 'position'
+ASE_COUNT_SNP_Gene_anno <- merge(combined_count_table, ANNO.CODING, by = c("contig", "position"), all.x = TRUE)
+colnames(ASE_COUNT_SNP_Gene_anno)
+
+ASE_COUNT_SNP_Gene_anno  <- ASE_COUNT_SNP_Gene_anno  %>%
+  select(id.x, rsID.x, id.y, rsID.y, name, ensid, biotype, everything())
+
+# Remove columns 'id.y' and 'rsID.y'
+ASE_COUNT_SNP_Gene_anno[, c("id.y", "rsID.y") := NULL]
+
+# View updated dataset
+head(ASE_COUNT_SNP_Gene_anno)
+
+
+# Rename columns
+setnames(ASE_COUNT_SNP_Gene_anno, old = c("id.x", "rsID.x", "contig"), new = c("SNP", "SNP_id", "chr"))
+
+
+ASE_COUNT_SNP_Gene_anno  <- ASE_COUNT_SNP_Gene_anno  %>%
+  select(chr, position, SNP, SNP_id, name, ensid, biotype, everything())
+
+
+# Keep only rows where chr is between 1 and 18
+ASE_COUNT_SNP_Gene_anno <- ASE_COUNT_SNP_Gene_anno[chr %in% 1:18]
+
+colnames(ASE_COUNT_SNP_Gene_anno)
+
+# Convert to data.table (if not already)
+setDT(ASE_COUNT_SNP_Gene_anno)
+
+# Columns to exclude
+exclude_cols <- c("chr", "position", "SNP", "SNP_id", "name", "ensid", "biotype")
+
+# Identify allele columns dynamically
+allele_cols <- setdiff(names(ASE_COUNT_SNP_Gene_anno), exclude_cols)  # Select all except excluded
+
+# Replace NA with 0 only in allele columns
+ASE_COUNT_SNP_Gene_anno[, (allele_cols) := lapply(.SD, function(x) fifelse(is.na(x), 0, x)), .SDcols = allele_cols]
+
+# View the updated data
+head(ASE_COUNT_SNP_Gene_anno)
+
+# Save the rearranged data to a CSV file
+fwrite(ASE_COUNT_SNP_Gene_anno, "/home/fb3/iqbal/winpro/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/ASE_COUNT_SNP_Gene_anno.csv") 
+
+
+# Define your dataset
+filtered_data <- ASE_COUNT_SNP_Gene_anno  # Replace with your actual data frame name
+
+# Assuming ASE_COUNT_SNP_Gene_anno is a data.table
+library(data.table)
+
+# Convert to data.table (if not already)
+setDT(filtered_data)
+
+
+# List of tissue prefixes
+tissue_prefixes <- c("B", "L", "M", "T", "O", "K")  # Brain, Liver, Muscle, Testis, Ovary, Kidney
+
+# Iterate over each tissue type
+for (prefix in tissue_prefixes) {
+    # Get all ref and alt allele columns for the tissue
+    ref_cols <- grep(paste0("^", prefix, "\\d+_refAllele$"), names(filtered_data), value = TRUE)
+    alt_cols <- grep(paste0("^", prefix, "\\d+_altAllele$"), names(filtered_data), value = TRUE)
+
+    # Apply filtering conditions
+    for (i in seq_along(ref_cols)) {
+        ref_col <- ref_cols[i]
+        alt_col <- alt_cols[i]
+
+        # Update filtered_data using := for in-place modification
+        filtered_data[, (ref_col) := fifelse(
+            (.SD[[ref_col]] == 0 | .SD[[alt_col]] == 0) | 
+            (.SD[[ref_col]] < 5 | .SD[[alt_col]] < 5) | 
+            ((.SD[[ref_col]] + .SD[[alt_col]]) < 50) | 
+            (.SD[[ref_col]] < 0.01 * (.SD[[ref_col]] + .SD[[alt_col]])), 
+            NA, .SD[[ref_col]]
+        ), .SDcols = c(ref_col, alt_col)]
+        
+        filtered_data[, (alt_col) := fifelse(
+            (.SD[[ref_col]] == 0 | .SD[[alt_col]] == 0) | 
+            (.SD[[ref_col]] < 5 | .SD[[alt_col]] < 5) | 
+            ((.SD[[ref_col]] + .SD[[alt_col]]) < 50) | 
+            (.SD[[ref_col]] < 0.01 * (.SD[[ref_col]] + .SD[[alt_col]])), 
+            NA, .SD[[alt_col]]
+        ), .SDcols = c(ref_col, alt_col)]
+    }
+}
+
+# Remove rows where all allele columns for all tissues are NA
+allele_cols <- unlist(lapply(tissue_prefixes, function(prefix) {
+    # Get all ref and alt allele columns for the tissue
+    ref_cols <- grep(paste0("^", prefix, "\\d+_refAllele$"), names(filtered_data), value = TRUE)
+    alt_cols <- grep(paste0("^", prefix, "\\d+_altAllele$"), names(filtered_data), value = TRUE)
+    c(ref_cols, alt_cols)  # Combine both ref and alt columns
+}))
+
+# Remove rows where all the selected columns are NA
+filtered_data <- filtered_data[rowSums(is.na(filtered_data[, allele_cols, with = FALSE])) < length(allele_cols), ]
+
+# View the filtered dataset
+head(filtered_data)
+
+filtered_data[filtered_data == ""] <- NA
+
+
+
+filtered_data <- fread("/home/fb3/iqbal/winpro/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/ASE_analysis/Output/filtered_data_Conditions.csv", header = TRUE, na.strings = c("", "NA"))
+
+# Replace all empty strings with NA
+filtered_data[filtered_data == ""] <- NA
+
+# View the updated dataset
+head(filtered_data)
+
+
+write.table(filtered_data, "/home/muhammad/winpro/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/filtered_data.txt", sep = "\t", row.names = FALSE)
+
+
+aggregated_data <- filtered__data %>%
+  group_by(name) %>%
+  summarize(
+    across(
+      starts_with("B10_refAllele"):ends_with("T97_altAllele"),
+      ~ sum(., na.rm = TRUE)
+    ),
+    count_genes = n()
+  ) %>%
+  filter(count_genes > 2)  # Keep only SNPs with more than 3 genes
+
+
+fwrite(aggregated_data, "/home/fb3/iqbal/mnt/winpro/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/Diff_ASE_Analysis/Input/aggregate_Gene_based.csv") 
+
+
+library(data.table)
+
+# --------------------------
+# 1. Clean and Prepare filtered_data
+# --------------------------
+# Remove rows where the gene name is NA
+filtered_data <- filtered_data[!is.na(name)]
+
+# Identify allele count columns (those ending in _refAllele or _altAllele)
+allele_cols <- grep("_(ref|alt)Allele$", names(filtered_data), value = TRUE)
+
+# Replace NA values in these allele count columns with 0
+filtered_data[, (allele_cols) := lapply(.SD, function(x) {
+  x[is.na(x)] <- 0
+  x
+}), .SDcols = allele_cols]
+
+# Create a unique SNP id column; here we assume the "SNP" column is already in "chr__position" format
+filtered_data[, id := SNP]
+
+
+# --------------------------
+# 2. Create Count Matrices
+# --------------------------
+# Identify columns ending in "_refAllele" and extract sample names by removing the suffix
+
+ref_cols <- grep("_refAllele$", colnames(filtered_data), value = TRUE)
+sample_names <- sub("_refAllele$", "", ref_cols)
+
+# Build the reference and alternate count matrices
+ref.table <- as.matrix(filtered_data[, ..ref_cols])
+alt_cols <- paste0(sample_names, "_altAllele")
+alt.table <- as.matrix(filtered_data[, ..alt_cols])
+
+# Set row names to the unique SNP id
+rownames(ref.table) <- filtered_data$id
+rownames(alt.table) <- filtered_data$id
+
+# Create the total counts matrix (ref + alt)
+tot.table <- ref.table + alt.table
+
+# Reassign column names to match design ids
+colnames(ref.table) <- sample_names
+colnames(alt.table) <- sample_names
+colnames(tot.table) <- sample_names
+
+
+# --------------------------
+# 3.Load Sample Metadata (Design) and Save Count Matrices
+# --------------------------
+
+# Adjust the file path as needed.
+design <- fread ("/home/fb3/iqbal/winpro/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/Metadata_Final.csv")
+# Assume that design contains a column 'id' with sample names matching those in tot.table.
+design <- design[match(design$id, colnames(tot.table))]
+stopifnot(all(colnames(tot.table) == design$id))
+
+# Save the count matrices and design into an Rda file
+save(ref.table, alt.table, tot.table, design, file = "input-tables-ase.Rda")
+
+
+# --------------------------
+# 4. Prepare the Annotation Table
+# --------------------------
+# 1. Prepare annotation data and match position to ref.table
+ANNO.CODING <- filtered_data[, .(id, name)]  # Assuming filtered_data already exists
+# Filter for rows with unambiguous gene names (i.e., no commas and non-missing)
+X <- ANNO.CODING[!grepl(",", name) & !is.na(name), .(name, id)]
+pos <- match(X$id, rownames(ref.table), nomatch = 0)
+
+
+# --------------------------
+# 5. Create ASEP Input Files for Each Sample
+# --------------------------
+
+tmp <- "/home/fb3/iqbal/winpro/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/tmp"
+
+# Ensure the tmp directory exists
+if (!dir.exists(tmp)) {
+  dir.create(tmp, recursive = TRUE)
+}
+
+for (sample in sample_names) {
+  out_file <- file.path(tmp, paste0(sample, ".gene.txt"))
+  
+  # Skip if a static output file exists already
+  if (file.exists(paste0(out_file, ".static.gene.pval.tab"))) next
+  
+  # Build the data table for the sample using the correct column names
+  Y <- data.table(
+    gene   = X$name[pos > 0],
+    snp.id = X$id[pos > 0],
+    ref.dp = ref.table[pos, sample],  # Use 'sample' directly for ref.dp
+    alt.dp = alt.table[pos, sample]   # Use 'sample' directly for alt.dp
+  )
+  
+  # Compute total depth (ref.dp + alt.dp) but don't keep the 'total' column
+  Y[, total := ref.dp + alt.dp]
+  
+  # Filter SNPs based on thresholds
+  Y <- Y[(ref.dp + alt.dp >= 50) & 
+         (ref.dp >= 5) & 
+         (alt.dp >= 5) & 
+         ((ref.dp / total) >= 0.01) & 
+         ((alt.dp / total) >= 0.01)]
+  
+  # Remove the 'total' column before writing to file
+  Y[, total := NULL]  # This removes the 'total' column
+  
+  # Check if column names match what you're expecting before writing
+  print("Column names in Y:")
+  print(colnames(Y))  # This will show the actual column names
+  
+  # Write the ASEP input file for the sample (with correct column order)
+  write.table(Y, file = out_file, sep = "\t", row.names = FALSE, quote = FALSE)
+}
+
+
+# Loop through each tissue type
+for (tiss in tissue_types) {
+  
+  # Find all files for the current tissue type (e.g., all files starting with "B" for Brain)
+  files <- list.files("/home/fb3/iqbal/winpro/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/tmp", pattern = paste0("^", tiss), full.names = TRUE)
+  
+  # Create file names (without extension and path)
+  names(files) <- sub(".gene.txt", "", sub(".*\\/", "", files))
+  
+  # Only keep files with names longer than 3 characters (to filter out unwanted files)
+  files <- files[nchar(names(files)) > 3]
+  
+  # Read and combine the data from all files for the current tissue type
+  XX <- do.call(rbind, lapply(1:length(files), function(i) {
+    # Read the file
+    Y <- fread(files[i])  
+    
+    # Check the column names to see if they match what we expect
+    print(paste("Processing file:", files[i]))
+    print("Column names in the file:")
+    print(colnames(Y))
+    
+    # Rename columns to standardize (e.g., "snp.id" to "snp", "ref.dp" to "ref", "alt.dp" to "alt")
+    colnames(Y)[which(colnames(Y) == "snp.id")] <- "snp"
+    colnames(Y)[which(colnames(Y) == "ref.dp")] <- "ref"
+    colnames(Y)[which(colnames(Y) == "alt.dp")] <- "alt"
+    
+    # Add the tissue name as the 'id' column for each sample
+    Y[, id := names(files)[i]]  # The 'id' column is the file name, which represents the sample
+    
+    # Check that the necessary columns exist after renaming
+    if (!all(c("ref", "alt") %in% colnames(Y))) {
+      stop("Missing 'ref' or 'alt' columns in file: ", files[i])
+    }
+    
+    # Calculate total depth (ref + alt reads)
+    Y[, total := ref + alt]  
+    
+    # Select relevant columns (gene, id, snp, ref, total)
+    Y[, .SD, .SDcols = c("gene", "id", "snp", "ref", "total")]  # Explicitly select the required columns
+    
+  }))
+  
+  # Sort the data by SNP
+  setorder(XX, "snp")
+  
+  # Save the combined count matrix as an RDS file for the tissue type
+  saveRDS(XX, file = paste0("ASEP-input-", tiss, ".Rds"))
+  
+
+}
+
+
+load("/home/fb3/iqbal/winpro/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/input-tables-ase.Rda")
+
+# --------------------------
+# Source Custom Functions (ASEP_F.R)
+# --------------------------
+source("/home/fb3/iqbal/winpro/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/ASEP_F.R")  # Change this to the correct path of your ASEP_F.R script
+logit <- "logit"
+
+
+
+
+# --------------------------
+# 6. One-Condition ASE Analysis (Within Generation, Tissue-Specific)
+# --------------------------
+
+library(data.table)
+
+ASEP_Output <- "/home/fb3/iqbal/winpro/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/ASEP_Output"
+
+# Get unique tissues and conditions
+unique_tissues <- unique(design$Tissue)
+conditions <- unique(design$BC)
+
+for(tiss in unique_tissues) {
+  for(cond in conditions) {
+    output_file <- file.path(ASEP_Output, paste0("ASEP_", tiss, "_", gsub(" ", "_", cond), "_resample1e4_seed0.txt"))
+    
+    # Skip if result file already exists
+    if (file.exists(output_file)) {
+      cat("Skipping:", tiss, cond, "as output already exists.\n")
+      next
+    }
+    
+    cat("Running ASE analysis for tissue:", tiss, "condition:", cond, "\n")
+    
+    # Subset design for the tissue and condition
+    cond_samples <- design[Tissue == tiss & BC == cond, id]
+    
+    # Read tissue-specific count matrix
+    XX <- readRDS(paste0("/home/fb3/iqbal/winpro/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/ASEP_Input/ASEP-input-", tiss, ".Rds"))
+    
+    # Assign group labels based on condition
+    XX[, group := ifelse(id %in% cond_samples, cond, NA)]
+    XX <- na.omit(XX)  # Remove rows not in the condition
+    XX[, group := factor(group)]
+    
+    # Run ASE detection
+    set.seed(0)
+    res <- ASE_detection2(XX, parallel = TRUE, phased = FALSE, adaptive = TRUE, 
+                          n_core = 70, n_resample = 1e4, save_out = TRUE, 
+                          name_out = output_file)
+    
+    cat("Completed ASE analysis for", tiss, cond, "\n")
+  }
+}
+
+
+
+
+
+
+
+# Open a PDF file to write to
+pdf("ASE_gene_mapped_tissue_specific_pig_eQTL.pdf", width = 8, height = 6)
+
+# Create the plot
+ggplot(data_tissu, aes(x = Tissue, y = Percent, fill = Group)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.9)) +
+  geom_text(aes(label = paste0(round(Percent, 1), "%")),
+            position = position_dodge(width = 0.9),
+            vjust = -0.3, size = 3.5) +
+  labs(title = "ASE_gene_mapped_tissue_specific_pig_eQTL", y = "Percentage", x = "Tissue") +
+  theme_minimal()
+
+# Close the PDF device
+dev.off()
+
+
+
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(VGAM)
+library(stringr)
+library(tidyverse)
+
+
+
+
+# 1. Load data -----------------------------------------------------------
+ase_counts <- read_csv("/home/fb3/iqbal/mnt/winpro/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/Diff_ASE_Analysis/Input/aggregate_Gene_based.csv") %>%
+  mutate(across(matches("_refAllele$|_altAllele$"), ~ na_if(.x, 0)))
+
+meta <- read_csv("/home/fb3/iqbal/mnt/winpro/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/Diff_ASE_Analysis/Input/Metadata_Final.csv",
+                 col_select = c(id, BC, Tissue)) %>%
+  rename(sample = id, Backcross = BC)
+
+# 2. Prepare ASE long data ------------------------------------------------
+ase_long <- ase_counts %>%
+  pivot_longer(
+    cols        = -name,
+    names_to    = c("sample", "allele"),
+    names_sep   = "_",
+    values_to   = "count"
+  ) %>%
+  mutate(
+    allele = if_else(str_detect(allele, "^ref"), "ref", "alt")
+  ) %>%
+  group_by(name, sample) %>%
+  summarise(
+    ref   = count[allele == "ref"],
+    alt   = count[allele == "alt"],
+    total = ref + alt,
+    .groups = "drop"
+  ) %>%
+  filter(total > 0) %>%
+  left_join(meta, by = "sample")
+
+# 3. Set up tissues and results container ---------------------------------
+
+input_dir <- "/home/fb3/iqbal/mnt/winpro/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/Diff_ASE_Analysis/Input"
+tissues   <- c("Brain", "Liver", "Kidney", "Muscle", "Ovary", "Testis")
+res_list  <- list()
+
+# 4. Loop over tissues ----------------------------------------------------
+for (t in tissues) {
+  # Build full paths to the two gene‐list CSVs:
+  gl_path <- file.path(input_dir, paste0(t, "_F1_GL.csv"))
+  pi_path <- file.path(input_dir, paste0(t, "_F1_Pi.csv"))
+  
+  gl_genes <- read_csv(gl_path, col_names = "name")$name
+  pi_genes <- read_csv(pi_path, col_names = "name")$name
+  genes_to_keep <- union(gl_genes, pi_genes)
+  
+  # 4b. Subset ASE data to tissue & those genes
+  dat_t <- ase_long %>%
+    filter(Tissue == t, name %in% genes_to_keep)
+  
+  # 4c. Set tissue‐specific filtering thresholds
+  if (t == "Ovary") {
+    minGL <- 5;  minPi <- 5
+  } else if (t == "Testis") {
+    minGL <- 5;  minPi <- 4
+  } else {
+    minGL <- 7;  minPi <- 7
+  }
+  
+  # 4d. For each gene, require at least minGL GL‐samples and minPi Pi‐samples
+  res_t <- dat_t %>%
+    group_by(name) %>%
+    filter(
+      sum(!is.na(ref) & Backcross == "F1 * GL") >= minGL,
+      sum(!is.na(ref) & Backcross == "F1 * Pi") >= minPi
+    ) %>%
+    group_split()
+  
+  # 4e. Fit beta‐binomial per gene and collect stats
+  res_df <- map_dfr(res_t, function(gdat) {
+    gene_id <- gdat$name[1]
+    tryCatch({
+      gdat$BC <- factor(gdat$Backcross)
+      fit <- vglm(cbind(ref, alt) ~ BC, betabinomial, data = gdat)
+      coefs <- coef(summary(fit))
+      
+      # p‐value for the Pi vs. GL effect
+      pval <- coefs["BCF1 * Pi", "Pr(>|z|)"]
+      
+      # mean ref‐ratio in each group
+      mean_GL <- mean(gdat$ref[gdat$Backcross=="F1 * GL"] /
+                        (gdat$ref[gdat$Backcross=="F1 * GL"] + gdat$alt[gdat$Backcross=="F1 * GL"]),
+                      na.rm=TRUE)
+      mean_Pi <- mean(gdat$ref[gdat$Backcross=="F1 * Pi"] /
+                        (gdat$ref[gdat$Backcross=="F1 * Pi"] + gdat$alt[gdat$Backcross=="F1 * Pi"]),
+                      na.rm=TRUE)
+      
+      log2FC <- log2((mean_GL + 1e-3)/(mean_Pi + 1e-3))
+      
+      tibble(
+        Tissue   = t,
+        name     = gene_id,
+        mean_GL  = mean_GL,
+        mean_Pi  = mean_Pi,
+        log2FC   = log2FC,
+        pval     = pval
+      )
+    }, error = function(e) NULL)
+  })
+  
+  # 4f. Multiple‐test correction and flag significant
+  res_df <- res_df %>%
+    mutate(
+      padj      = p.adjust(pval, method = "BH"),
+      negLog10P = -log10(padj),
+      sig       = padj < 0.05 & abs(log2FC) > log2(1.2)
+    )
+  
+  # 4g. Keep only significant hits (and sort)
+  res_list[[t]] <- res_df %>%
+    filter(sig) %>%
+    arrange(padj)
+}
+
+output_dir <- "/home/fb3/iqbal/mnt/winpro/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/Diff_ASE_Analysis/Output"
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# 2. Write out one CSV per tissue
+library(purrr)
+library(readr)
+
+walk2(
+  res_list,                    # list of tibbles
+  names(res_list),             # "Brain", "Liver", ...
+  ~ write_csv(
+    .x,
+    file.path(output_dir, paste0(.y, "_Differential_ASE.csv"))
+  )
+)
+
+# ─────────
+
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Setup & libraries
+# ──────────────────────────────────────────────────────────────────────────
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(pheatmap)
+library(grid)
+library(patchwork)  # for layout and auto-labels
+library(tibble)
+
+results_dir <- "/home/fb3/iqbal/mnt/winpro/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/Diff_ASE_Analysis/Output"
+
+# Tissues to include
+heatmap_tissues <- c("Kidney", "Brain", "Ovary", "Liver", "Muscle", "Testis")
+
+# Helper to read mean ratios
+read_mat <- function(t) {
+  df <- read_csv(file.path(results_dir, paste0(t, "_Differential_ASE.csv")))
+  mat <- df %>%
+    select(name, mean_GL, mean_Pi) %>%
+    column_to_rownames("name") %>%
+    as.matrix()
+  colnames(mat) <- c("F1_GL", "F1_Pi")
+  mat
+}
+
+# Generate heatmap plots wrapped for patchwork
+heatmap_wrapped <- lapply(heatmap_tissues, function(t) {
+  mat <- read_mat(t)
+  p <- pheatmap(
+    mat,
+    color           = heat.colors(50),
+    main            = t,
+    display_numbers = TRUE,
+    number_format   = "%.2f",
+    cluster_rows    = FALSE,
+    cluster_cols    = FALSE,
+    silent          = TRUE,
+    fontsize        = 8,
+    cellwidth       = 30,
+    cellheight      = 25
+  )
+  wrap_elements(p$gtable)
+})
+
+# Combine into 2 columns with A-F labels
+combined_plot <- wrap_plots(heatmap_wrapped) +
+  plot_layout(ncol = 2) +
+  plot_annotation(
+    title = "Mean Ref-Allele Ratios (F1_GL vs F1_Pi)",
+    theme = theme(plot.title = element_text(size = 16, face = "bold")),
+    tag_levels = "A"
+  )
+
+# Save to PDF
+ggsave(file.path(results_dir, "Combined_Heatmaps_AtoF.pdf"), combined_plot,
+       width = 14, height = 12)
+
+# Show on screen
+print(combined_plot)
+
+# ──────────────────────────────────────────────────────────────────────────
+# B) BOXPLOTS: Testis, Muscle, Liver (top 6 genes by |log2FC|)
+# ──────────────────────────────────────────────────────────────────────────
+
+# Ensure ase_long is in your workspace
+
+boxplot_tissues <- c("Kidney","Brain", "Ovary", "Liver", "Muscle", "Testis")
+
+for (t in boxplot_tissues) {
+  # 1. Read the differential ASE results
+  df <- read_csv(file.path(results_dir, paste0(t, "_Differential_ASE.csv")))
+  
+  # 2. Get the full list of significant genes
+  sig_genes <- df %>% pull(name)
+  
+  # 3. Extract per-sample ratios for all sig genes
+  plot_df <- ase_long %>%
+    filter(Tissue == t, name %in% sig_genes) %>%
+    mutate(ratio = ref / (ref + alt))
+  
+  # 4. Draw and save boxplot (one facet per gene)
+  pdf(file.path(results_dir, paste0("boxplot_", t, "_all_sig.pdf")),
+      width = 12, height = 8)
+  print(
+    ggplot(plot_df, aes(x = Backcross, y = ratio, fill = Backcross)) +
+      geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+      geom_jitter(width = 0.2, size = 1, alpha = 0.6) +
+      facet_wrap(~ name, scales = "free_y", ncol = 4) +   # adjust ncol as needed
+      labs(
+        title = paste0("All Significant ASE Genes in ", t),
+        x     = "Backcross",
+        y     = "Reference‐allele ratio"
+      ) +
+      scale_fill_manual(values = c("F1 * GL" = "red", "F1 * Pi" = "blue")) +
+      theme_minimal() +
+      theme(
+        strip.text      = element_text(face = "bold", size = 8),
+        axis.text.x     = element_text(angle = 45, hjust = 1),
+        legend.position = "none"
+      )
+  )
+  dev.off()
+}
+
+library(ASEP)
+library(dplyr)
+
+load("Z:/FBNProjectGroups/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/input-tables-ase.Rda")
+
+ASE_B <- readRDS("Z:/FBNProjectGroups/I3-NGS-noncoding/Muhammad/F2embryo/ASE_Analysis/ASEP_Input/ASEP-input-Brain.Rds")
+
+combined_filtered <- ASE_B %>%
+  inner_join(design, by = "id") %>%
+  select(gene, id, snp, ref, total, BC)
+
+ASE_B = phasing(combined_filtered , phased=FALSE, n_condition="one")
+
+filtered_KIF5A_GL <- ASE_B  %>%
+  filter(gene == "KIF5A", BC == "F1 * GL")
+
+
+plot_ASE(filtered_KIF5A_GL, phased=FALSE)
+
+
+
+filtered_KIF5A_Pi <- ASE_B  %>%
+  filter(gene == "KIF5A", BC == "F1 * Pi")
+
+Pi <- plot_ASE(filtered_KIF5A_Pi , phased=FALSE)
+
+
+
+if (!requireNamespace("pdftools", quietly = TRUE)) install.packages("pdftools")
+if (!requireNamespace("gridExtra", quietly = TRUE)) install.packages("gridExtra")
+
+library(pdftools)
+library(magick)
+library(grid)
+library(gridExtra)
+
+# ──────────────────────────────────────────────────────────────────────────
+# 2) Helper to read a PDF page into a raster grob via magick
+# ──────────────────────────────────────────────────────────────────────────
+pdf_to_grob <- function(path, page = 1, density = 300) {
+  # Read the PDF (no GS needed)
+  img <- image_read_pdf(path, density = density)
+  # Select only the page you want (magick-image list)
+  img_page <- img[page]
+  # Convert to an R raster
+  ras <- as.raster(img_page)
+  # Wrap in a grid grob
+  rasterGrob(ras, interpolate = TRUE)
+}
+
+# ──────────────────────────────────────────────────────────────────────────
+# 3) Read your 4 figures (adjust file names & pages as needed)
+# ──────────────────────────────────────────────────────────────────────────
+g1 <- pdf_to_grob("Z:/FBNProjectGroups/I3-NGS-noncoding/Muhammad/F2embryo/RNA-Seq_data_DE_Analysis/Output/Plots/PCA_Testis_within_backcross_group.pdf", page = 1)
+g2 <- pdf_to_grob("Z:/FBNProjectGroups/I3-NGS-noncoding/Muhammad/F2embryo/RNA-Seq_data_DE_Analysis/Output/Plots/PCA_Ovary_within_backcross_group.pdf", page = 1)
+g3 <- pdf_to_grob("Z:/FBNProjectGroups/I3-NGS-noncoding/Muhammad/F2embryo/RNA-Seq_data_DE_Analysis/Output/Plots/PCA_Kidney_within_backcross_group.pdf", page = 1)
+g4 <- pdf_to_grob("Z:/FBNProjectGroups/I3-NGS-noncoding/Muhammad/F2embryo/RNA-Seq_data_DE_Analysis/Output/Plots/PCA_Muscle_within_backcross_group.pdf", page = 1)
+g5 <- pdf_to_grob("Z:/FBNProjectGroups/I3-NGS-noncoding/Muhammad/F2embryo/RNA-Seq_data_DE_Analysis/Output/Plots/PCA_Liver_within_backcross_group.pdf", page = 1)
+g6 <- pdf_to_grob("Z:/FBNProjectGroups/I3-NGS-noncoding/Muhammad/F2embryo/RNA-Seq_data_DE_Analysis/Output/Plots/PCA_Brain_within_backcross_group.pdf", page = 1)
+
+# ──────────────────────────────────────────────────────────────────────────
+# 4) Arrange in a 2×2 grid and save
+# ──────────────────────────────────────────────────────────────────────────
+out_file <- "Z:/FBNProjectGroups/I3-NGS-noncoding/Muhammad/F2embryo/RNA-Seq_data_DE_Analysis/Output/Plots/combined_figures.pdf"
+pdf(out_file, width = 18, height = 12)
+grid.arrange(
+  g1, g2,
+  g3, g4,g5,g6,
+  ncol = 3,
+  top  = textGrob("Combined Panels", gp = gpar(fontsize = 16, fontface = "bold"))
+)
+dev.off()
+
+
+
+
+
+
+# Load required libraries
+library(ggplot2)
+library(dplyr)
+library(gridExtra)
+library(grid)
+
+# Step 1: Prepare the data
+data <- data.frame(
+  Tissue = rep(c("Brain", "Liver", "Muscle", "Kidney", "Testis", "Ovary"), 2),
+  Count = c(144, 85, 159, 5, 128, 32, 125, 90, 111, 6, 82, 43),
+  Total = c(371, 182, 250, 435, 339, 288, 296, 119, 164, 236, 223, 369),
+  Group = rep(c("F1 * GL", "F1 * Pi"), each = 6)
+)
+
+# Step 2: Compute percentages and labels correctly
+data <- data %>%
+  mutate(
+    Percent = round(Count / Total * 100, 1),  # correct percentage
+    Label = paste0(Count, "/", Total, "\n(", Percent, "%)")
+  )
+
+# Step 3: Add layout values for donut slices
+data <- data %>%
+  group_by(Group) %>%
+  arrange(Group, Tissue) %>%
+  mutate(
+    SlicePercent = Count / sum(Count) * 100,
+    ymax = cumsum(SlicePercent),
+    ymin = lag(ymax, default = 0),
+    mid = (ymin + ymax) / 2
+  )
+
+# Step 4: Set tissue-specific colors
+tissue_colors <- c(
+  Liver = "#D55E00", Brain = "#0072B2", Muscle = "#009E73", 
+  Kidney = "#F0E", Ovary = "#CC79A7", Testis = "#56B4E9"
+)
+
+# Step 5: Create a plotting function
+plot_donut <- function(group_data, title, show_legend = FALSE) {
+  p <- ggplot(group_data) +
+    geom_rect(aes(ymin = ymin, ymax = ymax, xmin = 3, xmax = 4, fill = Tissue), color = "white") +
+    geom_text(aes(x = 3.5, y = mid, label = Label), size = 3.5) +
+    coord_polar(theta = "y") +
+    scale_fill_manual(values = tissue_colors) +
+    xlim(2, 4) +
+    theme_void() +
+    ggtitle(title)
+  
+  if (!show_legend) {
+    p <- p + theme(legend.position = "none")
+  } else {
+    p <- p + theme(legend.position = "right")
+  }
+  return(p)
+}
+
+# Step 6: Generate plots
+plot_gl <- plot_donut(filter(data, Group == "F1 * GL"), "F1 * GL")
+plot_pi <- plot_donut(filter(data, Group == "F1 * Pi"), "F1 * Pi", show_legend = TRUE)
+
+# Step 7: Save to PDF with fixed size
+pdf("donut_plots_corrected.pdf", width = 12, height = 6)
+grid.arrange(plot_gl, plot_pi, ncol = 2)
+dev.off()
+
+
+
+
+```
+
