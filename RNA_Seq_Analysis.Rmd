@@ -1,0 +1,1885 @@
+x---
+title: "Gene Expression and ASE in F1*Pi and F1*GL"
+author: "Muhammad Arsalan Iqbal"
+date: "2025-01-20"
+output: word_document
+---
+
+## Working directory setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+knitr::opts_knit$set(root.dir = "Z:/FBNProjectGroups/I3-NGS-noncoding/Muhammad/F2embryo/RNA-Seq_data_DE_Analysis/Input File")
+
+```
+
+## loading required libraries
+
+```{r Load the required libraries}
+library(DESeq2)
+library(dplyr)
+library(lattice)
+library(ggplot2)
+library (stats)
+library(factoextra)
+library(FactoMineR)
+library(PCAtools)
+library(ellipse)
+library(bigutilsr)
+library(bigstatsr)
+library(ggforce)
+library(ggalt)
+library(outliers)
+library(extremevalues)
+library(mvoutlier)
+library(car)
+library(tidyr)
+library(withr)
+library(tibble)
+library(gridExtra)
+library(circlize)
+library(sva)
+library(arrayQualityMetrics)
+library(edgeR)
+```
+
+##loading Input data
+
+
+## Differential Expression analysis 
+
+```{r Differential Expression analysis}
+
+
+
+# Load required libraries
+# --------------------------------------
+# Load required libraries
+# --------------------------------------
+library(DESeq2)
+library(sva)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(ggrepel)
+library(cowplot)
+library(pheatmap)
+library(ggfortify)
+library(tibble)
+library(patchwork)
+library(scales)
+library(fmsb)
+
+# --------------------------------------
+# Load and preprocess data
+# --------------------------------------
+raw <- read.csv("Raw_count_table_Final.csv", check.names = FALSE, stringsAsFactors = FALSE)
+colnames(raw)[1] <- "GeneID"
+raw <- raw[!duplicated(raw$GeneID), ]
+rownames(raw) <- raw$GeneID
+count_data <- as.matrix(raw[, -1])
+
+dim(count_data)
+
+metadata <- read.csv("Metadata_Final.csv", stringsAsFactors = FALSE) %>%
+  mutate(
+    BC = factor(gsub("\\s*\\*\\s*", "*", BC), levels = c("F1*GL", "F1*Pi")),
+    Tissue = factor(Tissue),
+    Sex = factor(Sex)
+  ) %>%
+  filter(Samples %in% colnames(count_data)) %>%
+  arrange(match(Samples, colnames(count_data)))
+
+tissues <- c("Liver", "Brain", "Muscle", "Kidney", "Ovary", "Testis")
+
+tissue_colors <- c(
+  Liver = "#D55E00", Brain = "#0072B2", Muscle = "#009E73", 
+  Kidney = "#F0E", Ovary = "#CC79A7", Testis = "#56B4E9"
+)
+backcross_shapes <- c("F1*Pi" = 16, "F1*GL" = 17)
+
+# --------------------------------------
+# Global VST normalization
+# --------------------------------------
+dds_all <- DESeqDataSetFromMatrix(count_data, metadata, design = ~1)
+dds_all <- estimateSizeFactors(dds_all)
+vsd_all <- varianceStabilizingTransformation(dds_all)
+vsd_mat <- assay(vsd_all)
+
+# Storage
+summary_df <- data.frame()
+tissue_plots <- list()
+sv_counts <- list()
+retained_genes <- list()
+divergence_metrics <- list()
+correlations_df <- data.frame(Tissue = character(), Pearson = numeric(), Spearman = numeric(), stringsAsFactors = FALSE)
+
+# --------------------------------------
+# Function for tissue-specific analysis
+# --------------------------------------
+run_tissue_analysis <- function(tiss) {
+  cat("\nProcessing tissue:", tiss, "\n")
+
+  meta_t <- metadata %>% filter(Tissue == tiss) %>% droplevels()
+  counts_t <- count_data[, meta_t$Samples, drop = FALSE]
+  keep <- rowSums(counts_t >= 5) >= 0.8 * ncol(counts_t)
+  counts_t <- counts_t[keep, ]
+  retained_genes[[tiss]] <<- rownames(counts_t)
+
+  if (ncol(counts_t) < 5 || length(unique(meta_t$BC)) < 2) {
+    warning("Skipping ", tiss, ": insufficient samples or variation")
+    return(NULL)
+  }
+
+  if (tiss %in% c("Ovary", "Testis")) {
+    mod_full <- model.matrix(~ BC, data = meta_t)
+    mod_null <- model.matrix(~ 1, data = meta_t)
+  } else {
+    mod_full <- model.matrix(~ BC + Sex, data = meta_t)
+    mod_null <- model.matrix(~ Sex, data = meta_t)
+  }
+
+  dds0 <- DESeqDataSetFromMatrix(counts_t, meta_t, design = mod_full)
+  dds0 <- estimateSizeFactors(dds0)
+  vsd <- varianceStabilizingTransformation(dds0)
+
+  n.sv <- num.sv(assay(vsd), mod_full, method = "be")
+  sv_counts[[tiss]] <<- n.sv
+  if (n.sv > 0) {
+    svobj <- sva(assay(vsd), mod_full, mod_null, n.sv = n.sv)
+    sv_cols <- paste0("SV", 1:n.sv)
+    meta_t[sv_cols] <- svobj$sv
+  } else {
+    sv_cols <- character(0)
+  }
+
+  design_formula <- if (tiss %in% c("Ovary", "Testis")) {
+    as.formula(paste("~ BC", if(length(sv_cols)) paste("+", paste(sv_cols, collapse = " + ")) else ""))
+  } else {
+    as.formula(paste("~ BC + Sex", if(length(sv_cols)) paste("+", paste(sv_cols, collapse = " + ")) else ""))
+  }
+
+  dds <- DESeqDataSetFromMatrix(counts_t, meta_t, design = design_formula)
+  dds <- DESeq(dds)
+  res_all <- results(dds, contrast = c("BC", "F1*GL", "F1*Pi"))
+  res_all_df <- as.data.frame(res_all)
+  write.csv(res_all_df, paste0(tiss, "_DEG_All_Results.csv"))
+
+  res_sig <- res_all_df %>% filter(padj < 0.05)
+  if (nrow(res_sig) > 0) {
+    write.csv(res_sig, paste0(tiss, "_DEG_Significant_Results.csv"))
+  }
+
+  deg_effect <- if (nrow(res_sig) > 0) mean(abs(res_sig$log2FoldChange), na.rm = TRUE) else 0
+  transcriptome_divergence <- if (nrow(res_sig) > 0) sum(2^abs(res_sig$log2FoldChange)) / nrow(counts_t) else 0
+
+  pca_all_data <- plotPCA(vsd, intgroup = "BC", returnData = TRUE)
+  percentVar_all <- round(100 * attr(pca_all_data, "percentVar"))
+  pca_all_data$Tissue <- tiss
+
+  p_all <- ggplot(pca_all_data, aes(x = PC1, y = PC2, color = Tissue, shape = BC)) +
+    geom_point(size = 3) +
+    stat_ellipse(aes(group = BC), linetype = "dashed", size = 0.8) +
+    scale_color_manual(values = tissue_colors[tiss]) +
+    scale_shape_manual(values = backcross_shapes) +
+    labs(title = paste("Standard PCA:", tiss),
+         x = paste0("PC1: ", percentVar_all[1], "% variance"),
+         y = paste0("PC2: ", percentVar_all[2], "% variance")) +
+    theme_minimal()
+
+  tissue_plots[[tiss]] <<- list(standard = p_all, deg = NULL)
+
+  avg_expr <- data.frame(
+    Gene = rownames(vsd),
+    F1_GL = rowMeans(assay(vsd)[, meta_t$BC == "F1*GL", drop = FALSE]),
+    F1_Pi = rowMeans(assay(vsd)[, meta_t$BC == "F1*Pi", drop = FALSE])
+  )
+  avg_expr <- avg_expr %>% filter(Gene %in% retained_genes[[tiss]])
+
+  cor_pearson <- cor(avg_expr$F1_GL, avg_expr$F1_Pi, method = "pearson")
+  cor_spearman <- cor(avg_expr$F1_GL, avg_expr$F1_Pi, method = "spearman")
+
+  correlations_df <<- rbind(correlations_df, data.frame(
+    Tissue = tiss,
+    Pearson = cor_pearson,
+    Spearman = cor_spearman
+  ))
+
+  list(
+    summary = data.frame(
+      Tissue = tiss,
+      Samples = ncol(counts_t),
+      Genes_Retained = sum(keep),
+      SVs_Used = n.sv,
+      DEGs_Total = nrow(res_sig),
+      DEGs_Up_F1GL = sum(res_sig$log2FoldChange > 0, na.rm = TRUE),
+      DEGs_Down_F1GL = sum(res_sig$log2FoldChange < 0, na.rm = TRUE),
+      Avg_abs_log2FC = deg_effect,
+      Transcriptome_Divergence = transcriptome_divergence,
+      Separation_Distance = NA,
+      Pearson_Correlation = cor_pearson,
+      Spearman_Correlation = cor_spearman
+    )
+  )
+}
+
+# --------------------------------------
+# Run tissue analysis
+# --------------------------------------
+for (tiss in tissues) {
+  res <- run_tissue_analysis(tiss)
+  if (!is.null(res)) {
+    summary_df <- bind_rows(summary_df, res$summary)
+  }
+}
+
+# --------------------------------------
+# Normalize divergence metrics by sqrt(n_DEGs)
+# --------------------------------------
+summary_df <- summary_df %>%
+  mutate(
+    # Normalized divergence score (Δ')
+    Delta_norm = ifelse(DEGs_Total > 0, Transcriptome_Divergence / sqrt(DEGs_Total), 0),
+    # Normalized centroid distance (D')
+    Distance_norm = ifelse(DEGs_Total > 0, Separation_Distance / sqrt(DEGs_Total), 0)
+  )
+
+# Save updated summary
+write.csv(summary_df, "Summary_DEG_Results_with_Normalized_Metrics.csv", row.names = FALSE)
+
+# --------------------------------------
+# Plot normalized divergence metrics (New Figure 3B/C)
+# --------------------------------------
+# Ensure tissues are in order
+summary_df$Tissue <- factor(summary_df$Tissue, levels = c("Kidney", "Muscle", "Liver", "Brain", "Ovary", "Testis", "Global"))
+
+# Plot normalized divergence score (Δ')
+p_delta_norm <- ggplot(summary_df, aes(x = Tissue, y = Delta_norm, fill = Tissue)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = tissue_colors[as.character(summary_df$Tissue)]) +
+  labs(title = "Normalized Transcriptomic Divergence (Δ')",
+       y = "Δ' (normalized by √n_DEGs)",
+       x = "Tissue") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Plot normalized centroid distance (D')
+p_distance_norm <- ggplot(summary_df, aes(x = Tissue, y = Distance_norm, fill = Tissue)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = tissue_colors[as.character(summary_df$Tissue)]) +
+  labs(title = "Normalized Centroid Distance (D')",
+       y = "D' (normalized by √n_DEGs)",
+       x = "Tissue") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Combine plots
+combined_norm_plots <- p_delta_norm + p_distance_norm +
+  plot_layout(ncol = 2) +
+  plot_annotation(tag_levels = 'A')
+
+# Save
+ggsave("Figure_3B_3C_Normalized_Divergence.pdf", combined_norm_plots, width = 12, height = 6)
+print(combined_norm_plots)
+
+
+
+
+
+
+
+# --------------------------------------
+# Global DEG analysis with SVA
+# --------------------------------------
+cat("\nEstimating global surrogate variables for batch correction...\n")
+
+keep_global <- rowSums(count_data >= 5) >= 0.8 * ncol(count_data)
+count_data_global <- count_data[keep_global, ]
+
+metadata_global <- metadata %>% filter(Samples %in% colnames(count_data_global)) %>%
+  arrange(match(Samples, colnames(count_data_global)))
+
+include_sex <- all(!is.na(metadata_global$Sex)) && length(unique(metadata_global$Sex)) > 1
+
+if (include_sex) {
+  mod_full <- model.matrix(~ Tissue + Sex + BC, data = metadata_global)
+  mod_null <- model.matrix(~ Tissue + Sex, data = metadata_global)
+} else {
+  mod_full <- model.matrix(~ Tissue + BC, data = metadata_global)
+  mod_null <- model.matrix(~ Tissue, data = metadata_global)
+}
+
+dds_tmp <- DESeqDataSetFromMatrix(count_data_global, metadata_global, design = mod_full)
+dds_tmp <- estimateSizeFactors(dds_tmp)
+vsd_tmp <- varianceStabilizingTransformation(dds_tmp)
+
+n_sv_global <- num.sv(assay(vsd_tmp), mod_full, method = "be")
+cat("Number of surrogate variables estimated globally:", n_sv_global, "\n")
+
+if (n_sv_global > 0) {
+  svobj_global <- sva(assay(vsd_tmp), mod_full, mod_null, n.sv = n_sv_global)
+  sv_cols <- paste0("SV", 1:n_sv_global)
+  metadata_global[sv_cols] <- svobj_global$sv
+} else {
+  sv_cols <- character(0)
+}
+
+design_formula_global <- if (include_sex) {
+  as.formula(paste("~ Tissue + Sex + BC", if(length(sv_cols)) paste("+", paste(sv_cols, collapse = " + ")) else ""))
+} else {
+  as.formula(paste("~ Tissue + BC", if(length(sv_cols)) paste("+", paste(sv_cols, collapse = " + ")) else ""))
+}
+
+dds_global <- DESeqDataSetFromMatrix(count_data_global, metadata_global, design = design_formula_global)
+dds_global <- DESeq(dds_global)
+
+res_global <- results(dds_global, contrast = c("BC", "F1*GL", "F1*Pi"))
+res_global_df <- as.data.frame(res_global)
+write.csv(res_global_df, "Global_DEG_All_Results_with_SVs.csv")
+
+res_global_sig <- res_global_df %>% filter(padj < 0.05)
+if (nrow(res_global_sig) > 0) {
+  write.csv(res_global_sig, "Global_DEG_Significant_Results_with_SVs.csv")
+  cat("Significant DEGs (padj < 0.05) with SV correction:", nrow(res_global_sig), "\n")
+} else {
+  cat("No significant DEGs found in global analysis with SV correction.\n")
+}
+
+# Global metrics and append to summary
+deg_effect_global <- if (nrow(res_global_sig) > 0) mean(abs(res_global_sig$log2FoldChange), na.rm = TRUE) else 0
+transcriptome_divergence_global <- if (nrow(res_global_sig) > 0) sum(2^abs(res_global_sig$log2FoldChange)) / nrow(count_data_global) else 0
+
+avg_expr_global <- data.frame(
+  Gene = rownames(vsd_tmp),
+  F1_GL = rowMeans(assay(vsd_tmp)[, metadata_global$BC == "F1*GL", drop = FALSE]),
+  F1_Pi = rowMeans(assay(vsd_tmp)[, metadata_global$BC == "F1*Pi", drop = FALSE])
+)
+
+cor_pearson_global <- cor(avg_expr_global$F1_GL, avg_expr_global$F1_Pi, method = "pearson")
+cor_spearman_global <- cor(avg_expr_global$F1_GL, avg_expr_global$F1_Pi, method = "spearman")
+
+correlations_df <- bind_rows(correlations_df, data.frame(
+  Tissue = "Global",
+  Pearson = cor_pearson_global,
+  Spearman = cor_spearman_global
+))
+
+global_summary <- data.frame(
+  Tissue = "Global",
+  Samples = ncol(count_data_global),
+  Genes_Retained = nrow(count_data_global),
+  SVs_Used = n_sv_global,
+  DEGs_Total = nrow(res_global_sig),
+  DEGs_Up_F1GL = sum(res_global_sig$log2FoldChange > 0, na.rm = TRUE),
+  DEGs_Down_F1GL = sum(res_global_sig$log2FoldChange < 0, na.rm = TRUE),
+  Avg_abs_log2FC = deg_effect_global,
+  Transcriptome_Divergence = transcriptome_divergence_global,
+  Separation_Distance = NA,
+  Pearson_Correlation = cor_pearson_global,
+  Spearman_Correlation = cor_spearman_global
+)
+
+summary_df <- bind_rows(summary_df, global_summary)
+
+write.csv(summary_df, "Summary_DEG_Results.csv", row.names = FALSE)
+write.csv(correlations_df, "Tissue_F1GL_vs_F1Pi_Correlations.csv", row.names = FALSE)
+
+# [Remaining volcano and PCA plots remain unchanged...]
+
+
+# --------------------------------------
+# Global batch effect correction using SVA and DESeq2
+# --------------------------------------
+cat("\nEstimating global surrogate variables for batch correction...\n")
+
+# Filter genes for global analysis (≥5 counts in ≥80% samples)
+keep_global <- rowSums(count_data >= 5) >= 0.8 * ncol(count_data)
+count_data_global <- count_data[keep_global, ]
+
+# Filter metadata to match count_data_global columns
+metadata_global <- metadata %>% filter(Samples %in% colnames(count_data_global)) %>%
+  arrange(match(Samples, colnames(count_data_global)))
+
+# Build full and null model matrices for SVA (BC is variable of interest)
+include_sex <- all(!is.na(metadata_global$Sex)) && length(unique(metadata_global$Sex)) > 1
+
+if (include_sex) {
+  mod_full <- model.matrix(~ Tissue + Sex + BC, data = metadata_global)
+  mod_null <- model.matrix(~ Tissue + Sex, data = metadata_global)
+} else {
+  mod_full <- model.matrix(~ Tissue + BC, data = metadata_global)
+  mod_null <- model.matrix(~ Tissue, data = metadata_global)
+}
+
+# VST transform counts for SVA input
+dds_tmp <- DESeqDataSetFromMatrix(count_data_global, metadata_global, design = mod_full)
+dds_tmp <- estimateSizeFactors(dds_tmp)
+vsd_tmp <- varianceStabilizingTransformation(dds_tmp)
+
+# Estimate number of SVs globally
+n_sv_global <- num.sv(assay(vsd_tmp), mod_full, method = "be")
+cat("Number of surrogate variables estimated globally:", n_sv_global, "\n")
+
+# Run SVA if SVs detected
+if (n_sv_global > 0) {
+  svobj_global <- sva(assay(vsd_tmp), mod_full, mod_null, n.sv = n_sv_global)
+  sv_cols <- paste0("SV", 1:n_sv_global)
+  metadata_global[sv_cols] <- svobj_global$sv
+} else {
+  sv_cols <- character(0)
+}
+
+# Update design formula including SVs
+design_formula_global <- if (include_sex) {
+  as.formula(paste("~ Tissue + Sex + BC", if(length(sv_cols)) paste("+", paste(sv_cols, collapse = " + ")) else ""))
+} else {
+  as.formula(paste("~ Tissue + BC", if(length(sv_cols)) paste("+", paste(sv_cols, collapse = " + ")) else ""))
+}
+
+# Create DESeq2 dataset with surrogate variables
+dds_global <- DESeqDataSetFromMatrix(count_data_global, metadata_global, design = design_formula_global)
+
+# Run DESeq2
+dds_global <- DESeq(dds_global)
+
+# Extract global results for BC contrast
+res_global <- results(dds_global, contrast = c("BC", "F1*GL", "F1*Pi"))
+res_global_df <- as.data.frame(res_global)
+write.csv(res_global_df, "Global_DEG_All_Results_with_SVs.csv")
+
+# Filter significant global DEGs (padj < 0.05)
+res_global_sig <- res_global_df %>% filter(padj < 0.05)
+if (nrow(res_global_sig) > 0) {
+  write.csv(res_global_sig, "Global_DEG_Significant_Results_with_SVs.csv")
+  cat("Significant DEGs (padj < 0.05) with SV correction:", nrow(res_global_sig), "\n")
+} else {
+  cat("No significant DEGs found in global analysis with SV correction.\n")
+}
+
+# Volcano plot function
+plot_volcano <- function(file_path, tissue_name) {
+  df <- read.csv(file_path, row.names = 1, stringsAsFactors = FALSE)
+  df$gene <- rownames(df)
+  df <- df[!is.na(df$padj), ]
+
+  df <- df %>%
+    mutate(
+      DEGs = case_when(
+        padj < 0.05 & log2FoldChange > 0 ~ "Upregulated",
+        padj < 0.05 & log2FoldChange < 0 ~ "Downregulated",
+        TRUE ~ "Not Significant"
+      )
+    )
+
+  top_genes <- df %>%
+    filter(DEGs != "Not Significant") %>%
+    arrange(padj) %>%
+    head(10)
+
+  max_fc <- max(abs(df$log2FoldChange), na.rm = TRUE)
+  x_lim <- ceiling(max_fc * 1.1)
+
+  p <- ggplot(df, aes(x = log2FoldChange, y = -log10(padj), color = DEGs)) +
+    geom_point(alpha = 0.7, size = 2) +
+    geom_point(data = filter(df, DEGs != "Not Significant"), size = 3) +
+    geom_text_repel(aes(label = ifelse(gene %in% top_genes$gene, gene, NA)),
+                    max.overlaps = 10, box.padding = 0.5, size = 3.5, show.legend = FALSE) +
+    scale_color_manual(values = c(
+      "Upregulated" = "red",
+      "Downregulated" = "darkgreen",
+      "Not Significant" = "gray70"
+    )) +
+    scale_x_continuous(limits = c(-x_lim, x_lim)) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+    labs(title = tissue_name, x = "log2 Fold Change", y = "-log10 Adjusted P-value") +
+    theme_minimal(base_size = 14) +
+    theme(
+      legend.position = "none",
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.line = element_line(colour = "black")
+    )
+
+  return(p)
+}
+
+# Create volcano plots
+files <- paste0(tissues, "_DEG_All_Results.csv")
+volcano_plots <- mapply(plot_volcano, files, tissues, SIMPLIFY = FALSE)
+
+combined_plot <- wrap_plots(volcano_plots) +
+  plot_layout(ncol = 2) +
+  plot_annotation(
+    title = "Volcano Plots of DEGs Across Tissues",
+    theme = theme(plot.title = element_text(size = 18, face = "bold")),
+    tag_levels = "A"
+  )
+
+ggsave("Combined_Volcano_Plots.pdf", combined_plot, width = 14, height = 12)
+print(combined_plot)
+
+# Global volcano plot
+p_global <- plot_volcano("Global_DEG_All_Results.csv", "Global: All Tissues")
+ggsave("Global_Volcano_Plot.pdf", p_global, width = 7, height = 6)
+print(p_global)
+
+
+# --------------------------------------
+# Global PCA plot
+# --------------------------------------
+cat("\nCreating PCA plot for global dataset...\n")
+
+pca_data_global <- plotPCA(vsd_all, intgroup = c("Tissue", "BC"), returnData = TRUE)
+percentVar_global <- round(100 * attr(pca_data_global, "percentVar"))
+
+p_pca_global <- ggplot(pca_data_global, aes(x = PC1, y = PC2, color = Tissue, shape = BC)) +
+  geom_point(size = 3) +
+  stat_ellipse(aes(group = interaction(Tissue, BC)), linetype = "dashed", alpha = 0.6) +
+  scale_color_manual(values = tissue_colors) +
+  scale_shape_manual(values = backcross_shapes) +
+  labs(title = "Global PCA: All Tissues",
+       x = paste0("PC1: ", percentVar_global[1], "% variance"),
+       y = paste0("PC2: ", percentVar_global[2], "% variance")) +
+  theme_minimal(base_size = 14)
+
+ggsave("Global_PCA_Plot.pdf", p_pca_global, width = 8, height = 6)
+print(p_pca_global)
+
+# --------------------------------------
+# Save PCA plots for each tissue
+# --------------------------------------
+cat("\nSaving individual PCA plots for each tissue...\n")
+
+pca_patchwork <- wrap_plots(
+  lapply(names(tissue_plots), function(tiss) {
+    if (!is.null(tissue_plots[[tiss]]$standard)) {
+      ggsave(paste0(tiss, "_PCA_Plot.pdf"), tissue_plots[[tiss]]$standard, width = 6, height = 5)
+      tissue_plots[[tiss]]$standard + ggtitle(tiss)
+    } else {
+      NULL
+    }
+  }),
+  ncol = 3
+)
+
+ggsave("Combined_Tissue_PCA_Plots.pdf", pca_patchwork, width = 16, height = 10)
+print(pca_patchwork)
+
+
+
+# --------------------------------------
+# End of script
+# --------------------------------------
+
+
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Function to plot and save boxplots for top DEGs in a tissue
+plot_top_DEGs_boxplot <- function(tiss, count_data, metadata, deg_results_file, vsd_matrix, top_n = 5, save_path = NULL) {
+  
+  # Read DEG results
+  deg_res <- read.csv(deg_results_file, row.names = 1, stringsAsFactors = FALSE)
+  
+  # Filter significant DEGs (padj < 0.05)
+  deg_sig <- deg_res %>% filter(!is.na(padj), padj < 0.05)
+  
+  if (nrow(deg_sig) == 0) {
+    message("No significant DEGs for tissue: ", tiss)
+    return(NULL)
+  }
+  
+  # Select top genes by smallest padj
+  top_genes <- deg_sig %>% arrange(padj) %>% head(top_n) %>% rownames()
+  
+  # Subset VST matrix for samples in this tissue and for top genes
+  meta_t <- metadata %>% filter(Tissue == tiss) %>% droplevels()
+  samples_t <- meta_t$Samples
+  vsd_sub <- vsd_matrix[top_genes, samples_t, drop = FALSE]
+  
+  # Convert to long format for ggplot
+  expr_long <- as.data.frame(t(vsd_sub)) %>%
+    mutate(Sample = rownames(.)) %>%
+    pivot_longer(cols = -Sample, names_to = "Gene", values_to = "VST_expr") %>%
+    left_join(meta_t[, c("Samples", "BC")], by = c("Sample" = "Samples"))
+  
+  # Create plot
+  p <- ggplot(expr_long, aes(x = BC, y = VST_expr, fill = BC)) +
+    geom_boxplot(outlier.size = 1) +
+    facet_wrap(~Gene, scales = "free_y") +
+    scale_fill_manual(values = c("F1*GL" = "#E69F00", "F1*Pi" = "#56B4E9")) +
+    labs(title = paste("Top", top_n, "DEGs in", tiss, "with VST expression"),
+         y = "VST expression", x = "Backcross") +
+    theme_minimal() +
+    theme(legend.position = "none")
+  
+  # Save or print plot
+  if (!is.null(save_path)) {
+    ggsave(filename = save_path, plot = p, width = 10, height = 6)
+    message("Saved plot for ", tiss, " to ", save_path)
+  } else {
+    print(p)
+  }
+}
+
+# Make sure output folder exists
+if (!dir.exists("plots")) dir.create("plots")
+
+# Vector of tissue names you want to process
+tissues <- unique(metadata$Tissue)  # example tissue names
+
+# Folder where DEG CSV files are located
+deg_results_folder <- "Z:/FBNProjectGroups/I3-NGS-noncoding/Muhammad/F2embryo/RNA-Seq_data_DE_Analysis/Input File"  # adjust this path as needed
+
+# Loop through tissues and generate/save plots
+for (tiss in tissues) {
+  deg_file <- file.path(deg_results_folder, paste0(tiss, "_DEG_All_Results.csv"))
+  plot_file <- file.path("plots", paste0(tiss, "_top_DEGs_boxplot.pdf"))
+  
+  if (file.exists(deg_file)) {
+    plot_top_DEGs_boxplot(
+      tiss = tiss,
+      count_data = count_data,
+      metadata = metadata,
+      deg_results_file = deg_file,
+      vsd_matrix = vsd_mat,
+      top_n = 5,
+      save_path = plot_file
+    )
+  } else {
+    message("No DEG file found for tissue: ", tiss)
+  }
+}
+
+library(dplyr)
+library(clusterProfiler)
+library(org.Ss.eg.db)
+library(biomaRt)
+library(readr)
+library(pheatmap)
+library(tibble)
+library(purrr)
+
+# 1. Gene mapping function (Ensembl or SYMBOL to ENTREZID)
+map_genes_to_entrez <- function(genes) {
+  ensembl_ids <- genes[grepl("^ENS", genes)]
+  symbols <- setdiff(genes, ensembl_ids)
+  
+  pig_mart <- useMart("ensembl", dataset = "sscrofa_gene_ensembl")
+  
+  ensembl_map <- getBM(
+    attributes = c("ensembl_gene_id", "entrezgene_id"),
+    filters = "ensembl_gene_id",
+    values = ensembl_ids,
+    mart = pig_mart
+  )
+  ensembl_entrez <- ensembl_map$entrezgene_id
+  
+  symbol_map <- tryCatch(
+    bitr(symbols, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Ss.eg.db),
+    error = function(e) data.frame(SYMBOL=character(), ENTREZID=character())
+  )
+  symbol_entrez <- symbol_map$ENTREZID
+  
+  entrez_ids <- unique(c(ensembl_entrez, symbol_entrez))
+  entrez_ids <- entrez_ids[!is.na(entrez_ids)]
+  return(entrez_ids)
+}
+
+# 2. Enrichment functions
+run_kegg_enrich <- function(gene_vec) {
+  if (length(gene_vec) < 5) return(NULL)
+  enrichKEGG(gene = gene_vec, organism = "ssc", pvalueCutoff = 1, pAdjustMethod = "BH")
+}
+
+run_go_bp_enrich <- function(gene_vec) {
+  if (length(gene_vec) < 5) return(NULL)
+  enrichGO(gene = gene_vec, OrgDb = org.Ss.eg.db, keyType = "ENTREZID", ont = "BP",
+           pvalueCutoff = 1, pAdjustMethod = "BH", readable = TRUE)
+}
+
+# 3. Combine enrichment scores with stats function - NO filtering here!
+combine_scores_with_stats <- function(enrich_up, enrich_down, prefix = "") {
+  up_df <- if (!is.null(enrich_up)) as.data.frame(enrich_up) else data.frame()
+  down_df <- if (!is.null(enrich_down)) as.data.frame(enrich_down) else data.frame()
+  
+  # No filtering applied: keep all results
+  up_scores <- up_df %>%
+    mutate(score_up = -log10(pvalue)) %>%
+    dplyr::select(ID, Description, score_up, pvalue_up = pvalue, p.adjust_up = p.adjust, Count_up = Count)
+  
+  down_scores <- down_df %>%
+    mutate(score_down = -log10(pvalue)) %>%
+    dplyr::select(ID, Description, score_down, pvalue_down = pvalue, p.adjust_down = p.adjust, Count_down = Count)
+  
+  combined <- full_join(up_scores, down_scores, by = c("ID", "Description")) %>%
+    mutate(
+      score_up = ifelse(is.na(score_up), 0, score_up),
+      score_down = ifelse(is.na(score_down), 0, score_down),
+      score = score_up - score_down,
+      ID = paste0(prefix, ID)
+    ) %>%
+    dplyr::select(ID, Description, score,
+           pvalue_up, p.adjust_up, Count_up,
+           pvalue_down, p.adjust_down, Count_down)
+  
+  return(combined)
+}
+
+# 4. Load your global DEG data
+deg_global <- read_csv("Global_DEG_Significant_Results_with_SVs.csv")
+colnames(deg_global)
+
+# Check required columns
+stopifnot(all(c("Gene", "log2FoldChange") %in% colnames(deg_global)))
+
+# 5. Separate upregulated and downregulated genes for F1_GL vs F1_Pi
+genes_up <- deg_global$Gene[deg_global$log2FoldChange > 0]
+genes_down <- deg_global$Gene[deg_global$log2FoldChange < 0]
+
+# 6. Map gene IDs to Entrez IDs
+entrez_up <- map_genes_to_entrez(genes_up)
+entrez_down <- map_genes_to_entrez(genes_down)
+
+# 7. Run enrichment analyses
+kegg_up <- run_kegg_enrich(entrez_up)
+kegg_down <- run_kegg_enrich(entrez_down)
+go_up <- run_go_bp_enrich(entrez_up)
+go_down <- run_go_bp_enrich(entrez_down)
+
+# 8. Combine enrichment results with stats (prefixes "KEGG_" and "GO_") - no filtering applied
+kegg_results <- combine_scores_with_stats(kegg_up, kegg_down, prefix = "KEGG_")
+go_results <- combine_scores_with_stats(go_up, go_down, prefix = "GO_")
+
+# 9. Save full enrichment tables (all results)
+write.csv(kegg_results, "Global_KEGG_Enrichment_F1_GL_vs_F1_Pi.csv", row.names = FALSE)
+write.csv(go_results, "Global_GO_BP_Enrichment_F1_GL_vs_F1_Pi.csv", row.names = FALSE)
+
+`
+
+
+
+# --------------------------------------
+# Load required libraries
+# --------------------------------------
+library(DESeq2)
+library(sva)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(ggrepel)
+library(cowplot)
+library(pheatmap)
+library(ggfortify)
+library(tibble)
+library(patchwork)
+library(scales)
+library(fmsb)
+
+# --------------------------------------
+# Load and preprocess data
+# --------------------------------------
+raw <- read.csv("Raw_count_table_Final.csv", check.names = FALSE, stringsAsFactors = FALSE)
+colnames(raw)[1] <- "GeneID"
+raw <- raw[!duplicated(raw$GeneID), ]
+rownames(raw) <- raw$GeneID
+count_data <- as.matrix(raw[, -1])
+
+dim(count_data)
+
+metadata <- read.csv("Metadata_Final.csv", stringsAsFactors = FALSE) %>%
+  mutate(
+    BC = factor(gsub("\\s*\\*\\s*", "*", BC), levels = c("F1*GL", "F1*Pi")),
+    Tissue = factor(Tissue),
+    Sex = factor(Sex)
+  ) %>%
+  filter(Samples %in% colnames(count_data)) %>%
+  arrange(match(Samples, colnames(count_data)))
+
+tissues <- c("Liver", "Brain", "Muscle", "Kidney", "Ovary", "Testis")
+
+tissue_colors <- c(
+  Liver = "#D55E00", Brain = "#0072B2", Muscle = "#009E73", 
+  Kidney = "#F0E", Ovary = "#CC79A7", Testis = "#56B4E9"
+)
+backcross_shapes <- c("F1*Pi" = 16, "F1*GL" = 17)
+
+
+# --------------------------------------
+# Global VST normalization
+# --------------------------------------
+dds_all <- DESeqDataSetFromMatrix(count_data, metadata, design = ~1)
+dds_all <- estimateSizeFactors(dds_all)
+vsd_all <- varianceStabilizingTransformation(dds_all)
+vsd_mat <- assay(vsd_all)
+
+# Storage
+summary_df <- data.frame()
+tissue_plots <- list()
+sv_counts <- list()
+retained_genes <- list()
+divergence_metrics <- list()
+correlations_df <- data.frame(Tissue = character(), Pearson = numeric(), Spearman = numeric(), stringsAsFactors = FALSE)
+
+# --------------------------------------
+# Modified function for tissue-specific analysis with DEG-PCA
+# --------------------------------------
+run_tissue_analysis <- function(tiss) {
+  cat("\nProcessing tissue:", tiss, "\n")
+  
+  meta_t <- metadata %>% filter(Tissue == tiss) %>% droplevels()
+  counts_t <- count_data[, meta_t$Samples, drop = FALSE]
+  keep <- rowSums(counts_t >= 5) >= 0.8 * ncol(counts_t)
+  counts_t <- counts_t[keep, ]
+  retained_genes[[tiss]] <<- rownames(counts_t)
+  
+  if (ncol(counts_t) < 5 || length(unique(meta_t$BC)) < 2) {
+    warning("Skipping ", tiss, ": insufficient samples or variation")
+    return(NULL)
+  }
+  
+  if (tiss %in% c("Ovary", "Testis")) {
+    mod_full <- model.matrix(~ BC, data = meta_t)
+    mod_null <- model.matrix(~ 1, data = meta_t)
+  } else {
+    mod_full <- model.matrix(~ BC + Sex, data = meta_t)
+    mod_null <- model.matrix(~ Sex, data = meta_t)
+  }
+  
+  dds0 <- DESeqDataSetFromMatrix(counts_t, meta_t, design = mod_full)
+  dds0 <- estimateSizeFactors(dds0)
+  vsd <- varianceStabilizingTransformation(dds0)
+  
+  n.sv <- num.sv(assay(vsd), mod_full, method = "be")
+  sv_counts[[tiss]] <<- n.sv
+  if (n.sv > 0) {
+    svobj <- sva(assay(vsd), mod_full, mod_null, n.sv = n.sv)
+    sv_cols <- paste0("SV", 1:n.sv)
+    meta_t[sv_cols] <- svobj$sv
+  } else {
+    sv_cols <- character(0)
+  }
+  
+  design_formula <- if (tiss %in% c("Ovary", "Testis")) {
+    as.formula(paste("~ BC", if(length(sv_cols)) paste("+", paste(sv_cols, collapse = " + ")) else ""))
+  } else {
+    as.formula(paste("~ BC + Sex", if(length(sv_cols)) paste("+", paste(sv_cols, collapse = " + ")) else ""))
+  }
+  
+  dds <- DESeqDataSetFromMatrix(counts_t, meta_t, design = design_formula)
+  dds <- DESeq(dds)
+  res_all <- results(dds, contrast = c("BC", "F1*GL", "F1*Pi"))
+  res_all_df <- as.data.frame(res_all)
+  write.csv(res_all_df, paste0(tiss, "_DEG_All_Results.csv"))
+  
+  res_sig <- res_all_df %>% filter(padj < 0.05)
+  if (nrow(res_sig) > 0) {
+    write.csv(res_sig, paste0(tiss, "_DEG_Significant_Results.csv"))
+  }
+  
+  deg_effect <- if (nrow(res_sig) > 0) mean(abs(res_sig$log2FoldChange), na.rm = TRUE) else 0
+  transcriptome_divergence <- if (nrow(res_sig) > 0) sum(2^abs(res_sig$log2FoldChange)) / nrow(counts_t) else 0
+  
+  # Standard PCA
+  pca_all_data <- plotPCA(vsd, intgroup = "BC", returnData = TRUE)
+  percentVar_all <- round(100 * attr(pca_all_data, "percentVar"))
+  pca_all_data$Tissue <- tiss
+  
+  p_all <- ggplot(pca_all_data, aes(x = PC1, y = PC2, color = BC, shape = BC)) +
+    geom_point(size = 3) +
+    stat_ellipse(aes(group = BC), linetype = "dashed", size = 0.8) +
+    scale_color_manual(values = backcross_colors) +
+    scale_shape_manual(values = backcross_shapes) +
+    labs(title = paste("Standard PCA:", tiss),
+         x = paste0("PC1: ", percentVar_all[1], "% variance"),
+         y = paste0("PC2: ", percentVar_all[2], "% variance")) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  
+  # DEG-focused PCA
+  separation_distance <- NA
+  p_degs <- NULL
+  
+  if (nrow(res_sig) > 0) {
+    # Subset to significant DEGs
+    deg_counts <- counts_t[rownames(counts_t) %in% rownames(res_sig), , drop = FALSE]
+    
+    # Create DESeq object for DEGs
+    dds_degs <- DESeqDataSetFromMatrix(
+      deg_counts,
+      colData = meta_t,
+      design = design_formula
+    )
+    
+    # Variance stabilizing transformation
+    vsd_degs <- varianceStabilizingTransformation(dds_degs)
+    
+    # Perform PCA
+    pca_data_degs <- plotPCA(vsd_degs, intgroup = "BC", returnData = TRUE)
+    percentVar_degs <- round(100 * attr(pca_data_degs, "percentVar"))
+    
+    # Calculate separation distance between centroids
+    centroids <- pca_data_degs %>%
+      group_by(BC) %>%
+      summarize(PC1 = mean(PC1), PC2 = mean(PC2))
+    
+    separation_distance <- dist(centroids[, c("PC1", "PC2")]) %>% as.numeric()
+    
+    # Create DEG-PCA plot
+    p_degs <- ggplot(pca_data_degs, aes(x = PC1, y = PC2, color = BC, shape = BC)) +
+      geom_point(size = 3) +
+      geom_point(data = centroids, size = 5, shape = 3, color = "black", stroke = 1.5) +
+      stat_ellipse(aes(group = BC), linetype = "dashed", size = 0.8) +
+      scale_color_manual(values = backcross_colors) +
+      scale_shape_manual(values = backcross_shapes) +
+      labs(title = paste("DEG-Focused PCA:", tiss),
+           x = paste0("PC1: ", percentVar_degs[1], "% variance"),
+           y = paste0("PC2: ", percentVar_degs[2], "% variance"),
+           subtitle = paste0(nrow(res_sig), " DEGs | Separation Distance = ", 
+                            round(separation_distance, 3))) +
+      theme_minimal() +
+      theme(legend.position = "bottom")
+  } else {
+    # Create placeholder plot if no DEGs
+    p_degs <- ggplot() + 
+      annotate("text", x = 0.5, y = 0.5, label = "No significant DEGs", size = 6) + 
+      theme_void() +
+      labs(title = paste("DEG-Focused PCA:", tiss))
+  }
+  
+  tissue_plots[[tiss]] <<- list(standard = p_all, deg = p_degs)
+  
+  # Expression correlation
+  avg_expr <- data.frame(
+    Gene = rownames(vsd),
+    F1_GL = rowMeans(assay(vsd)[, meta_t$BC == "F1*GL", drop = FALSE]),
+    F1_Pi = rowMeans(assay(vsd)[, meta_t$BC == "F1*Pi", drop = FALSE])
+  )
+  avg_expr <- avg_expr %>% filter(Gene %in% retained_genes[[tiss]])
+  
+  cor_pearson <- cor(avg_expr$F1_GL, avg_expr$F1_Pi, method = "pearson")
+  cor_spearman <- cor(avg_expr$F1_GL, avg_expr$F1_Pi, method = "spearman")
+  
+  correlations_df <<- rbind(correlations_df, data.frame(
+    Tissue = tiss,
+    Pearson = cor_pearson,
+    Spearman = cor_spearman
+  ))
+  
+  list(
+    summary = data.frame(
+      Tissue = tiss,
+      Samples = ncol(counts_t),
+      Genes_Retained = sum(keep),
+      SVs_Used = n.sv,
+      DEGs_Total = nrow(res_sig),
+      DEGs_Up_F1GL = sum(res_sig$log2FoldChange > 0, na.rm = TRUE),
+      DEGs_Down_F1GL = sum(res_sig$log2FoldChange < 0, na.rm = TRUE),
+      Avg_abs_log2FC = deg_effect,
+      Transcriptome_Divergence = transcriptome_divergence,
+      Separation_Distance = separation_distance,
+      Pearson_Correlation = cor_pearson,
+      Spearman_Correlation = cor_spearman
+    )
+  )
+}
+
+# --------------------------------------
+# Run tissue analysis
+# --------------------------------------
+for (tiss in tissues) {
+  res <- run_tissue_analysis(tiss)
+  if (!is.null(res)) {
+    summary_df <- bind_rows(summary_df, res$summary)
+  }
+}
+
+# --------------------------------------
+# Create diagnostic plots
+# --------------------------------------
+create_diagnostic_plots <- function(summary_df) {
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(patchwork)
+
+  # Filter out Global and tissues without DEGs
+  tissue_df <- summary_df %>% 
+    filter(Tissue != "Global") %>%
+    mutate(Tissue = factor(Tissue, levels = tissues))
+
+  # A: DEG Directionality by Tissue with labels
+  deg_direction <- tissue_df %>%
+    dplyr::select(Tissue, DEGs_Up_F1GL, DEGs_Down_F1GL) %>%
+    pivot_longer(cols = -Tissue, names_to = "Direction", values_to = "Count") %>%
+    mutate(Direction = ifelse(grepl("Up", Direction), "Up in F1_GL", "Down in F1_GL"))
+
+  p_A <- ggplot(deg_direction, aes(x = Tissue, y = Count, fill = Direction)) +
+    geom_bar(stat = "identity", position = "stack") +
+    geom_text(aes(label = Count), 
+              position = position_stack(vjust = 0.5), 
+              size = 3, color = "white") +
+    scale_fill_manual(values = c("Up in F1_GL" = "red", "Down in F1_GL" = "darkgreen")) +
+    labs(title = "A: DEG Directionality by Tissue", x = "", y = "Number of DEGs") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "right")
+
+  # B: Separation Distance vs. Genes Retained with point labels
+  p_B <- ggplot(tissue_df, aes(x = Genes_Retained, y = Separation_Distance)) +
+    geom_point(aes(color = Tissue), size = 5) +
+    geom_text(aes(label = round(Separation_Distance, 2)), vjust = -1, size = 3) +
+    geom_smooth(method = "lm", se = FALSE, color = "gray30", linetype = "dashed") +
+    scale_color_manual(values = tissue_colors) +
+    labs(title = "B: Separation Distance vs. Genes Retained", 
+         x = "Genes Retained", y = "Separation Distance (DEG-PCA)") +
+    theme_minimal() +
+    theme(legend.position = "right")
+
+  # C: Average Absolute log2FC (Lollipop Chart) with labels
+  p_C <- ggplot(tissue_df, aes(x = reorder(Tissue, -Avg_abs_log2FC), y = Avg_abs_log2FC)) +
+    geom_segment(aes(xend = Tissue, yend = 0), color = "gray50", linewidth = 1.5) +
+    geom_point(aes(color = Tissue), size = 7) +
+    geom_text(aes(label = round(Avg_abs_log2FC, 2)), vjust = -1, size = 3) +
+    scale_color_manual(values = tissue_colors) +
+    labs(title = "C: Average Absolute log2 Fold Change", 
+         x = "", y = "Avg |log2 Fold Change|") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "right")
+
+  # D: Transcriptome Divergence with labels
+  p_D <- ggplot(tissue_df, aes(x = reorder(Tissue, -Transcriptome_Divergence), 
+                               y = Transcriptome_Divergence, fill = Tissue)) +
+    geom_bar(stat = "identity") +
+    geom_text(aes(label = round(Transcriptome_Divergence, 2)), 
+              vjust = -0.3, size = 3) +
+    scale_fill_manual(values = tissue_colors) +
+    labs(title = "D: Transcriptome Divergence", 
+         x = "", y = "Transcriptome Divergence") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "right")
+
+  # Combine diagnostic plots with individual legends
+  diagnostic_plot <- (p_A + p_B) / (p_C + p_D) + 
+    plot_annotation(title = "Transcriptomic Divergence Diagnostic Plots",
+                    theme = theme(plot.title = element_text(size = 16, face = "bold"))) +
+    plot_layout(guides = "keep")  # Don't collect legends globally
+
+  # Save to PDF with custom size
+  ggsave("Diagnostic_Plots.pdf", diagnostic_plot, width = 14, height = 12)
+
+  return(diagnostic_plot)
+}
+
+# --------------------------------------
+# Global DEG analysis with SVA
+# --------------------------------------
+cat("\nEstimating global surrogate variables for batch correction...\n")
+
+keep_global <- rowSums(count_data >= 5) >= 0.8 * ncol(count_data)
+count_data_global <- count_data[keep_global, ]
+
+metadata_global <- metadata %>% filter(Samples %in% colnames(count_data_global)) %>%
+  arrange(match(Samples, colnames(count_data_global)))
+
+include_sex <- all(!is.na(metadata_global$Sex)) && length(unique(metadata_global$Sex)) > 1
+
+if (include_sex) {
+  mod_full <- model.matrix(~ Tissue + Sex + BC, data = metadata_global)
+  mod_null <- model.matrix(~ Tissue + Sex, data = metadata_global)
+} else {
+  mod_full <- model.matrix(~ Tissue + BC, data = metadata_global)
+  mod_null <- model.matrix(~ Tissue, data = metadata_global)
+}
+
+dds_tmp <- DESeqDataSetFromMatrix(count_data_global, metadata_global, design = mod_full)
+dds_tmp <- estimateSizeFactors(dds_tmp)
+vsd_tmp <- varianceStabilizingTransformation(dds_tmp)
+
+n_sv_global <- num.sv(assay(vsd_tmp), mod_full, method = "be")
+cat("Number of surrogate variables estimated globally:", n_sv_global, "\n")
+
+if (n_sv_global > 0) {
+  svobj_global <- sva(assay(vsd_tmp), mod_full, mod_null, n.sv = n_sv_global)
+  sv_cols <- paste0("SV", 1:n_sv_global)
+  metadata_global[sv_cols] <- svobj_global$sv
+} else {
+  sv_cols <- character(0)
+}
+
+design_formula_global <- if (include_sex) {
+  as.formula(paste("~ Tissue + Sex + BC", if(length(sv_cols)) paste("+", paste(sv_cols, collapse = " + ")) else ""))
+} else {
+  as.formula(paste("~ Tissue + BC", if(length(sv_cols)) paste("+", paste(sv_cols, collapse = " + ")) else ""))
+}
+
+dds_global <- DESeqDataSetFromMatrix(count_data_global, metadata_global, design = design_formula_global)
+dds_global <- DESeq(dds_global)
+
+res_global <- results(dds_global, contrast = c("BC", "F1*GL", "F1*Pi"))
+res_global_df <- as.data.frame(res_global)
+write.csv(res_global_df, "Global_DEG_All_Results_with_SVs.csv")
+
+res_global_sig <- res_global_df %>% filter(padj < 0.05)
+if (nrow(res_global_sig) > 0) {
+  write.csv(res_global_sig, "Global_DEG_Significant_Results_with_SVs.csv")
+  cat("Significant DEGs (padj < 0.05) with SV correction:", nrow(res_global_sig), "\n")
+} else {
+  cat("No significant DEGs found in global analysis with SV correction.\n")
+}
+
+# Global metrics and append to summary
+deg_effect_global <- if (nrow(res_global_sig) > 0) mean(abs(res_global_sig$log2FoldChange), na.rm = TRUE) else 0
+transcriptome_divergence_global <- if (nrow(res_global_sig) > 0) sum(2^abs(res_global_sig$log2FoldChange)) / nrow(count_data_global) else 0
+
+avg_expr_global <- data.frame(
+  Gene = rownames(vsd_tmp),
+  F1_GL = rowMeans(assay(vsd_tmp)[, metadata_global$BC == "F1*GL", drop = FALSE]),
+  F1_Pi = rowMeans(assay(vsd_tmp)[, metadata_global$BC == "F1*Pi", drop = FALSE])
+)
+
+cor_pearson_global <- cor(avg_expr_global$F1_GL, avg_expr_global$F1_Pi, method = "pearson")
+cor_spearman_global <- cor(avg_expr_global$F1_GL, avg_expr_global$F1_Pi, method = "spearman")
+
+correlations_df <- bind_rows(correlations_df, data.frame(
+  Tissue = "Global",
+  Pearson = cor_pearson_global,
+  Spearman = cor_spearman_global
+))
+
+global_summary <- data.frame(
+  Tissue = "Global",
+  Samples = ncol(count_data_global),
+  Genes_Retained = nrow(count_data_global),
+  SVs_Used = n_sv_global,
+  DEGs_Total = nrow(res_global_sig),
+  DEGs_Up_F1GL = sum(res_global_sig$log2FoldChange > 0, na.rm = TRUE),
+  DEGs_Down_F1GL = sum(res_global_sig$log2FoldChange < 0, na.rm = TRUE),
+  Avg_abs_log2FC = deg_effect_global,
+  Transcriptome_Divergence = transcriptome_divergence_global,
+  Separation_Distance = NA,
+  Pearson_Correlation = cor_pearson_global,
+  Spearman_Correlation = cor_spearman_global
+)
+
+summary_df <- bind_rows(summary_df, global_summary)
+
+write.csv(summary_df, "Summary_DEG_Results.csv", row.names = FALSE)
+write.csv(correlations_df, "Tissue_F1GL_vs_F1Pi_Correlations.csv", row.names = FALSE)
+
+
+
+
+# --------------------------------------
+# Generate and save plots
+# --------------------------------------
+# Create diagnostic plots
+
+find("select")
+
+# Save diagnostic plots to PDF with custom size
+pdf("diagnostic_plots.pdf", width = 10, height = 7)  # Width and height in inches
+
+# Create and print the diagnostic plots
+create_diagnostic_plots(summary_df)
+print(diag_plots)  # Or use a loop if diag_plots is a list
+
+# Close the PDF device
+dev.off()
+
+
+select <- dplyr::select
+diag_plots <- create_diagnostic_plots(summary_df)
+
+
+# Load necessary libraries
+library(ggplot2)
+library(patchwork)
+
+
+
+# Rebuild each plot to enforce consistent color/shape aesthetics
+deg_pca_plots <- lapply(tissues, function(tiss) {
+  p <- tissue_plots[[tiss]]$deg
+  
+  if (!is.null(p)) {
+    # Rebuild the plot with updated aesthetics (color = Tissue, shape = Backcross)
+    p <- p +
+      scale_color_manual(values = tissue_colors) +
+      scale_shape_manual(values = backcross_shapes) +
+      ggtitle(tiss) +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(hjust = 0.5),
+        legend.position = "bottom"
+      )
+    return(p)
+  }
+  return(NULL)
+})
+
+# Remove NULLs (in case any tissue didn't have a DEG plot)
+deg_pca_plots <- Filter(Negate(is.null), deg_pca_plots)
+
+# Combine all DEG-PCA plots into a single layout
+deg_pca_combined <- (
+  wrap_plots(deg_pca_plots) + 
+    plot_layout(ncol = 3, guides = "collect") +
+    plot_annotation(title = "DEG-Focused PCA by Tissue") &
+    theme(legend.position = "bottom")
+)
+
+# Save the final plot
+ggsave("Combined_DEG_PCA_Plots.pdf", deg_pca_combined, width = 16, height = 10)
+
+
+
+# Combine standard PCA plots
+standard_pca_plots <- lapply(tissues, function(tiss) {
+  if (!is.null(tissue_plots[[tiss]]$standard)) {
+    return(tissue_plots[[tiss]]$standard)
+  }
+  return(NULL)
+})
+
+standard_pca_combined <- wrap_plots(standard_pca_plots) + 
+  plot_layout(ncol = 3, guides = "collect") +
+  plot_annotation(title = "Standard PCA by Tissue") &
+  theme(legend.position = "bottom")
+
+ggsave("Combined_Standard_PCA_Plots.pdf", standard_pca_combined, width = 16, height = 10)
+
+# Volcano plot function
+plot_volcano <- function(file_path, tissue_name) {
+  df <- read.csv(file_path, row.names = 1, stringsAsFactors = FALSE)
+  df$gene <- rownames(df)
+  df <- df[!is.na(df$padj), ]
+
+  df <- df %>%
+    mutate(
+      DEGs = case_when(
+        padj < 0.05 & log2FoldChange > 0 ~ "Upregulated",
+        padj < 0.05 & log2FoldChange < 0 ~ "Downregulated",
+        TRUE ~ "Not Significant"
+      )
+    )
+
+  top_genes <- df %>%
+    filter(DEGs != "Not Significant") %>%
+    arrange(padj) %>%
+    head(10)
+
+  max_fc <- max(abs(df$log2FoldChange), na.rm = TRUE)
+  x_lim <- ceiling(max_fc * 1.1)
+
+  p <- ggplot(df, aes(x = log2FoldChange, y = -log10(padj), color = DEGs)) +
+    geom_point(alpha = 0.7, size = 2) +
+    geom_point(data = filter(df, DEGs != "Not Significant"), size = 3) +
+    geom_text_repel(aes(label = ifelse(gene %in% top_genes$gene, gene, NA)),
+                    max.overlaps = 10, box.padding = 0.5, size = 3.5, show.legend = FALSE) +
+    scale_color_manual(values = c(
+      "Upregulated" = "red",
+      "Downregulated" = "darkgreen",
+      "Not Significant" = "gray70"
+    )) +
+    scale_x_continuous(limits = c(-x_lim, x_lim)) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+    labs(title = tissue_name, x = "log2 Fold Change", y = "-log10 Adjusted P-value") +
+    theme_minimal(base_size = 14) +
+    theme(
+      legend.position = "none",
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.line = element_line(colour = "black")
+    )
+
+  return(p)
+}
+
+# Create volcano plots
+files <- paste0(tissues, "_DEG_All_Results.csv")
+volcano_plots <- mapply(plot_volcano, files, tissues, SIMPLIFY = FALSE)
+
+combined_plot <- wrap_plots(volcano_plots) +
+  plot_layout(ncol = 2) +
+  plot_annotation(
+    title = "Volcano Plots of DEGs Across Tissues",
+    theme = theme(plot.title = element_text(size = 18, face = "bold")),
+    tag_levels = "A"
+  )
+
+ggsave("Combined_Volcano_Plots.pdf", combined_plot, width = 14, height = 12)
+print(combined_plot)
+
+# Global volcano plot
+p_global <- plot_volcano("Global_DEG_All_Results_with_SVs.csv", "Global: All Tissues")
+ggsave("Global_Volcano_Plot.pdf", p_global, width = 7, height = 6)
+print(p_global)
+
+# --------------------------------------
+# Global PCA plot
+# --------------------------------------
+cat("\nCreating PCA plot for global dataset...\n")
+
+pca_data_global <- plotPCA(vsd_all, intgroup = c("Tissue", "BC"), returnData = TRUE)
+percentVar_global <- round(100 * attr(pca_data_global, "percentVar"))
+
+p_pca_global <- ggplot(pca_data_global, aes(x = PC1, y = PC2, color = Tissue, shape = BC)) +
+  geom_point(size = 3) +
+  stat_ellipse(aes(group = interaction(Tissue, BC)), linetype = "dashed", alpha = 0.6) +
+  scale_color_manual(values = tissue_colors) +
+  scale_shape_manual(values = backcross_shapes) +
+  labs(title = "Global PCA: All Tissues",
+       x = paste0("PC1: ", percentVar_global[1], "% variance"),
+       y = paste0("PC2: ", percentVar_global[2], "% variance")) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom")
+
+ggsave("Global_PCA_Plot.pdf", p_pca_global, width = 8, height = 6)
+print(p_pca_global)
+
+# --------------------------------------
+# Print completion message
+# --------------------------------------
+cat("\nAnalysis complete! All outputs saved to working directory.\n")
+
+# Assuming summary_df is already defined and loaded
+diagnostic_plot <- create_diagnostic_plots(summary_df)
+
+# --------------------------------------
+# Create Consistent Color DEG-PCA Plots
+# --------------------------------------
+
+# Function to create DEG-PCA with tissue-specific coloring
+create_tissue_deg_pca <- function(tiss) {
+  # Load DEG results
+  deg_file <- paste0(tiss, "_DEG_Significant_Results.csv")
+  if (!file.exists(deg_file) return(NULL)
+  
+  deg_genes <- read.csv(deg_file, row.names = 1) %>% rownames()
+  
+  # Get metadata for tissue
+  meta_t <- metadata %>% filter(Tissue == tiss) %>% droplevels()
+  
+  # Subset VSD data to DEGs
+  vsd_t <- vsd_mat[rownames(vsd_mat) %in% deg_genes, meta_t$Samples]
+  
+  # Perform PCA
+  pca <- prcomp(t(vsd_t), scale. = TRUE)
+  pca_data <- as.data.frame(pca$x[, 1:2])
+  percent_var <- round(100 * pca$sdev^2 / sum(pca$sdev^2))
+  
+  # Add metadata
+  pca_data$Samples <- rownames(pca_data)
+  pca_data <- merge(pca_data, meta_t, by = "Samples")
+  
+  # Calculate centroids
+  centroids <- pca_data %>%
+    group_by(BC) %>%
+    summarize(PC1 = mean(PC1), PC2 = mean(PC2))
+  
+  # Create plot with tissue color
+  ggplot(pca_data, aes(x = PC1, y = PC2, shape = BC)) +
+    geom_point(size = 4, color = tissue_colors[tiss], alpha = 0.8) +
+    geom_point(data = centroids, size = 6, shape = 3, color = "black", stroke = 1.5) +
+    stat_ellipse(aes(group = BC), linetype = "dashed", color = "black", size = 0.8) +
+    scale_shape_manual(values = backcross_shapes) +
+    labs(title = tiss,
+         x = paste0("PC1: ", percent_var[1], "% variance"),
+         y = paste0("PC2: ", percent_var[2], "% variance"),
+         subtitle = paste0(length(deg_genes), " DEGs | ",
+                          "Separation: ", 
+                          round(dist(centroids[, c("PC1", "PC2")), 3))) +
+    theme_minimal() +
+    theme(legend.position = "bottom",
+          plot.title = element_text(color = tissue_colors[tiss], 
+                                    face = "bold", size = 12))
+}
+
+# Create all tissue DEG-PCA plots with consistent colors
+deg_pca_plots <- lapply(tissues, function(tiss) {
+  cat("Creating DEG-PCA for:", tiss, "\n")
+  p <- create_tissue_deg_pca(tiss)
+  if (is.null(p)) {
+    # Create empty plot with message
+    ggplot() +
+      annotate("text", x = 0.5, y = 0.5, 
+               label = paste("No DEGs in", tiss), size = 5) +
+      theme_void() +
+      labs(title = tiss)
+  } else {
+    p
+  }
+})
+
+# Create named list of plots
+names(deg_pca_plots) <- tissues
+
+# --------------------------------------
+# FINAL DIAGNOSTIC FIGURE WITH COLOR FIXES
+# --------------------------------------
+library(patchwork)
+
+# 1. Global PCA -----------------------------------------------------------
+p_global <- ggplot(pca_data_global, aes(x = PC1, y = PC2, color = Tissue, shape = BC)) +
+  geom_point(size = 3, alpha = 0.8) +
+  stat_ellipse(aes(group = interaction(Tissue, BC)), linetype = "dashed", size = 0.5) +
+  scale_color_manual(values = tissue_colors) +  # Ensure colors are applied
+  scale_shape_manual(values = backcross_shapes) +
+  labs(title = "A. Global Transcriptomic Architecture",
+       x = paste0("PC1: ", percentVar_global[1], "% variance"),
+       y = paste0("PC2: ", percentVar_global[2], "% variance")) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right",
+        plot.title = element_text(face = "bold"))
+
+# 2. Tissue DEG-PCA Plots with Consistent Colors --------------------------
+create_colored_deg_pca <- function(tiss) {
+  # Get tissue-specific DEG-PCA plot
+  p <- tissue_plots[[tiss]]$deg
+  
+  # Modify to use tissue-specific color
+  p <- p +
+    geom_point(aes(shape = BC), size = 3, color = tissue_colors[tiss], alpha = 0.8) +  # Set fixed color
+    scale_shape_manual(values = backcross_shapes) +
+    scale_color_manual(values = c("F1*GL" = "black", "F1*Pi" = "black")) +  # Set centroid color
+    labs(title = tiss) +
+    theme(legend.position = "none",
+          plot.title = element_text(color = tissue_colors[tiss], 
+                                    face = "bold", size = 10))
+  return(p)
+}
+
+# Create all tissue DEG-PCA plots
+deg_pca_plots <- lapply(tissues, function(tiss) {
+  create_colored_deg_pca(tiss)
+})
+
+# Arrange in grid
+deg_grid <- wrap_plots(deg_pca_plots, ncol = 3) +
+  plot_annotation(title = "B. Tissue-Specific DEG Separation",
+                  theme = theme(plot.title = element_text(face = "bold", size = 14)))
+
+# 3. Transcriptome Divergence ---------------------------------------------
+p_divergence <- summary_df %>%
+  filter(Tissue != "Global") %>%
+  ggplot(aes(reorder(Tissue, -Transcriptome_Divergence), 
+         Transcriptome_Divergence, fill = Tissue)) +
+  geom_col() +  # Use geom_col for bar plot
+  geom_text(aes(label = round(Transcriptome_Divergence, 3)), 
+            vjust = -0.5, size = 3.5) +
+  scale_fill_manual(values = tissue_colors) +  # Apply color mapping
+  labs(title = "C. Transcriptome Divergence",
+       x = "", y = "Divergence Metric") +
+  ylim(0, max(summary_df$Transcriptome_Divergence[summary_df$Tissue != "Global"], na.rm = TRUE) * 1.2) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none",
+        plot.title = element_text(face = "bold"))
+
+# 4. Separation Distance --------------------------------------------------
+p_separation <- summary_df %>%
+  filter(Tissue != "Global") %>%
+  ggplot(aes(reorder(Tissue, -Separation_Distance), 
+         Separation_Distance, fill = Tissue)) +
+  geom_col() +  # Use geom_col for bar plot
+  geom_text(aes(label = round(Separation_Distance, 2)), 
+            vjust = -0.5, size = 3.5) +
+  scale_fill_manual(values = tissue_colors) +  # Apply color mapping
+  labs(title = "D. Population Separation Distance",
+       x = "", y = "Centroid Distance (DEG-PCA space)") +
+  ylim(0, max(summary_df$Separation_Distance[summary_df$Tissue != "Global"], na.rm = TRUE) * 1.2) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none",
+        plot.title = element_text(face = "bold"))
+
+# 5. Combine all components ------------------------------------------------
+# Using patchwork syntax: 
+# | for side-by-side, / for top-to-bottom
+diagnostic_figure <- (
+  # Top row: Global PCA and metrics
+  (p_global | (p_divergence / p_separation)) /
+  # Bottom row: DEG-PCA grid
+  deg_grid
+) +
+  # Set relative row heights
+  plot_layout(heights = c(1, 1.5)) 
+
+# Save as PDF with Cairo device for better color support
+ggsave("Final_Diagnostic_Figure.pdf", diagnostic_figure, 
+       width = 16, height = 18, dpi = 300, device = cairo_pdf)
+
+# Additional save as PNG for quick verification
+ggsave("Final_Diagnostic_Figure.png", diagnostic_figure, 
+       width = 16, height = 14, dpi = 300)
+
+
+# List your tissue files
+files <- c("Brain_DEG_Significant_Results.csv",
+           "Kidney_DEG_Significant_Results.csv",
+           "Liver_DEG_Significant_Results.csv",
+           "Muscle_DEG_Significant_Results.csv",
+           "Ovary_DEG_Significant_Results.csv",
+           "Testis_DEG_Significant_Results.csv")
+
+# Empty data frame to collect
+all_genes <- data.frame(gene = character(), comparison = character(), stringsAsFactors = FALSE)
+
+for (f in files) {
+  
+  # Read CSV with gene names as row names
+  df <- read.csv(f, header = TRUE, stringsAsFactors = FALSE, row.names = 1)
+  
+  # Extract tissue name from file
+  tissue <- sub("_DEG_Significant_Results.csv", "", f)
+  
+  # Create comparison label
+  comp_str <- paste0("F1_GL vs F1_Pi_", tissue)
+  
+  # Get gene names
+  genes <- rownames(df)
+  
+  # Append to all_genes
+  temp <- data.frame(gene = genes, comparison = rep(comp_str, length(genes)), stringsAsFactors = FALSE)
+  all_genes <- rbind(all_genes, temp)
+}
+
+# Save combined file
+write.csv(all_genes, "All_Tissues_Genes_Comparison.csv", row.names = FALSE)
+
+cat("Saved: All_Tissues_Genes_Comparison.csv\n")
+
+library(pheatmap)
+
+# Read combined file
+df <- read.csv("All_Tissues_Genes_Comparison.csv", stringsAsFactors = FALSE)
+
+# Split genes by tissue
+gene_lists <- split(df$gene, df$comparison)
+gene_lists <- lapply(gene_lists, unique)
+
+# Find genes shared in all tissues
+shared_all <- Reduce(intersect, gene_lists)
+
+# Create presence/absence matrix for shared genes
+all_genes <- shared_all  # only shared genes
+
+presence_matrix <- sapply(gene_lists, function(genes) {
+  all_genes %in% genes
+})
+
+colnames(presence_matrix) <- names(gene_lists)
+rownames(presence_matrix) <- all_genes
+
+# Heatmap
+pheatmap(presence_matrix, 
+         cluster_rows = TRUE, cluster_cols = TRUE,
+         show_rownames = TRUE,
+         main = "Presence/Absence of Shared Genes Across Tissues")
+
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+df <- data.frame(
+  GO_Term = c(
+    "mitochondrial respiratory chain complex assembly",
+    "electron transport chain",
+    "ATP synthesis coupled electron transport",
+    "epigenetic regulation of gene expression",
+    "regulation of actin filament-based process",
+    "amino acid biosynthetic process",
+    "oxidative phosphorylation",
+    "neural crest cell differentiation",
+    "lipid oxidation",
+    "regulation of muscle contraction",
+    "amino acid metabolic process",
+    "peptidyl-amino acid modification",
+    "mitochondrial membrane organization",
+    "meiotic cell cycle",
+    "oogenesis"
+  ),
+  PValue  = c(0,0,0.01,0.01,0.01,0.01,0.01,0.02,0.02,0.03,0.03,0.03,0.04,0.04,0.04),
+  F1GL_gt = c(72.73,81.82,87.5,17.65,65.52,100,87.5,14.29,54.55,88.89,71.43,80,77.78,7.14,0),
+  F1GL_lt = c(27.27,18.18,12.5,82.35,34.48,0,12.5,85.71,45.45,11.11,28.57,20,22.22,92.86,100)
+)
+
+# Significance stars & factor for legend
+df <- df %>%
+  mutate(PValue_star = case_when(
+    PValue <= 0.001 ~ "***",
+    PValue <= 0.01  ~ "**",
+    PValue <= 0.05  ~ "*",
+    TRUE ~ ""
+  ),
+  PValue_cat = factor(PValue_star, 
+                      levels = c("***", "**", "*", ""),
+                      labels = c("p ≤ 0.001", "p ≤ 0.01", "p ≤ 0.05", "ns"))
+  )
+
+# Long format
+df_long <- df %>%
+  pivot_longer(c(F1GL_gt, F1GL_lt), names_to = "Direction", values_to = "Percent") %>%
+  mutate(Direction = dplyr::recode(
+    as.character(Direction),
+    "F1GL_gt" = "F1 × GL > F1 × Pi",
+    "F1GL_lt" = "F1 × GL < F1 × Pi"
+  ))
+
+# Order GO terms by p-value (most significant at top)
+order_terms <- df %>% arrange(PValue) %>% pull(GO_Term)
+df_long$GO_Term <- factor(df_long$GO_Term, levels = rev(order_terms))
+
+# Create plot
+p <- ggplot(df_long, aes(x = Percent, y = GO_Term, fill = Direction)) +
+  geom_col(position = "fill", width = 0.8) +
+  geom_text(aes(label = paste0(round(Percent, 1), "%")), 
+            position = position_fill(vjust = 0.5), size = 3, color = "white") +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_fill_manual(values = c("F1 × GL > F1 × Pi" = "red",
+                               "F1 × GL < F1 × Pi" = "darkgreen")) +
+  geom_text(data = df,
+            aes(x = 1.02, y = factor(GO_Term, levels = rev(order_terms)),
+                label = PValue_star, color = PValue_cat),
+            inherit.aes = FALSE,
+            hjust = 0, size = 4) +
+  scale_color_manual(name = "P-value", 
+                     values = c("p ≤ 0.001" = "black",
+                                "p ≤ 0.01" = "black",
+                                "p ≤ 0.05" = "black",
+                                "ns" = "grey60")) +
+  coord_cartesian(xlim = c(0, 1.1), clip = "off") +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "right",
+    axis.title.y = element_blank(),
+    axis.title.x = element_text(),
+    plot.margin = margin(10, 40, 10, 10)
+  ) +
+  labs(x = "Proportion of genes (100%)", fill = "Direction",
+       title = "GO Biological Process enrichment (directional proportions)")
+
+# Save to PDF
+ggsave(
+  filename = "GO_Biological_Process_enrichment.pdf",
+  plot = p,
+  width = 12,
+  height = 8,
+  units = "in"
+)
+
+
+# Required packages
+if(!requireNamespace("ggplot2", quietly=TRUE)) install.packages("ggplot2")
+if(!requireNamespace("dplyr", quietly=TRUE)) install.packages("dplyr")
+if(!requireNamespace("tidyr", quietly=TRUE)) install.packages("tidyr")
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# ---- Data: replace or adapt if needed ----
+counts <- data.frame(
+  Comparison = c(
+    "F1*GL Liver vs F1*Pi Liver",
+    "F1*GL Brain vs F1*Pi Brain",
+    "F1*GL Muscle vs F1*Pi Muscle",
+    "F1*GL Kidney vs F1*Pi Kidney",
+    "F1*GL Testis vs F1*Pi Testis",
+    "F1*GL Ovary vs F1*Pi Ovary"
+  ),
+  DEGs = c(178, 343, 375, 948, 43, 11),
+  up = c(81, 269, 162, 601, 15, 6),    # F1*GL > F1*Pi
+  down = c(97, 74, 213, 347, 28, 5)    # F1*GL < F1*Pi
+)
+
+# make a short tissue name column
+counts <- counts %>%
+  mutate(tissue = c("Liver","Brain","Muscle","Kidney","Testis","Ovary"),
+         total = up + down)
+
+# order tissues by total (descending) for plotting
+counts <- counts %>% arrange(desc(total))
+counts$tissue <- factor(counts$tissue, levels = counts$tissue)
+
+# pivot longer for ggplot
+plot_df <- counts %>%
+  select(tissue, up, down, total) %>%
+  pivot_longer(cols = c("up","down"), names_to = "direction", values_to = "n")
+
+# set direction factor so fill ordering is stable (up at bottom)
+plot_df$direction <- factor(plot_df$direction, levels = c("up","down"))
+
+# ---- Plot ----
+p <- ggplot(plot_df, aes(x = tissue, y = n, fill = direction)) +
+  geom_bar(stat = "identity", width = 0.65) +
+  # counts inside bar segments
+  geom_text(aes(label = n), position = position_stack(vjust = 0.5), size = 3.2, color = "white") +
+  # totals above bars
+  geom_text(data = distinct(plot_df, tissue, .keep_all = TRUE),
+            aes(x = tissue, y = total, label = total),
+            vjust = -0.5, size = 3.6) +
+  scale_fill_manual(
+    name = "Direction",
+    values = c("up" = "red", "down" = "darkgreen"),
+    labels = c("F1*GL > F1*Pi (up)", "F1*GL < F1*Pi (down)")
+  ) +
+  labs(
+    x = NULL,
+    y = "Number of DEGs",
+    title = "Stacked bar chart of DEG counts per tissue (F1*GL vs F1*Pi)",
+    caption = "DEG counts by direction; thresholds used in DEG calling (report these in manuscript)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 30, hjust = 1),
+    legend.position = "top",
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5)
+  )
+
+# expand y-limits a little so totals don't overlap
+ymax <- max(counts$total) * 1.10
+p <- p + coord_cartesian(ylim = c(0, ymax))
+
+# show
+print(p)
+
+# ---- Save files ----
+ggsave("deg_stacked_bar.png", plot = p, width = 10, height = 6, dpi = 300)
+ggsave("deg_stacked_bar.pdf", plot = p, width = 10, height = 6)
+
+library(ggplot2)
+library(dplyr)
+library(ggforce)
+library(tidyr)
+
+# Reorder GO terms for plotting
+data <- data %>% mutate(y = factor(Biological_Process, levels = rev(Biological_Process)))
+
+# Prepare pie chart data
+pie_data <- data %>%
+  rowwise() %>%
+  mutate(group = list(c("Up","Down")),
+         value = list(c(Percent_GT, Percent_LT))) %>%
+  unnest(c(group, value)) %>%
+  group_by(GO_ID) %>%
+  mutate(
+    start = 2*pi*cumsum(c(0, head(value/100, -1))),
+    end = 2*pi*cumsum(value/100)
+  ) %>% ungroup()
+
+# Plot with discrete y-axis
+ggplot(pie_data, aes(y = y)) +
+  geom_arc_bar(aes(
+    x0 = Gene_Count, y0 = as.numeric(y), r0 = 0, r = 0.4,
+    start = start, end = end, fill = group
+  ), color = "black") +
+  scale_fill_manual(values = c("Up" = "steelblue", "Down" = "orange")) +
+  scale_y_discrete() +  # <- use discrete scale for categorical axis
+  labs(x = "Gene Count", y = "", fill = "Proportion") +
+  theme_minimal()
+
+
+# Load required libraries
+library(tidyverse)
+library(scatterpie)
+library(stringr)
+
+# Create the data frame
+data <- data.frame(
+    GO_Term_ID = c("GO:0033108", "GO:0022900", "GO:0042773", "GO:0040029", 
+                   "GO:0032970", "GO:0008652", "GO:0006119", "GO:0014033", 
+                   "GO:0034440", "GO:0006937", "GO:0006520", "GO:0018193", 
+                   "GO:0007006", "GO:0051321", "GO:0048477"),
+    Biological_Process = c("mitochondrial respiratory chain complex assembly", 
+                           "electron transport chain", 
+                           "ATP synthesis coupled electron transport", 
+                           "epigenetic regulation of gene expression", 
+                           "regulation of actin filament-based process", 
+                           "amino acid biosynthetic process", 
+                           "oxidative phosphorylation", 
+                           "neural crest cell differentiation", 
+                           "lipid oxidation", 
+                           "regulation of muscle contraction", 
+                           "amino acid metabolic process", 
+                           "peptidyl-amino acid modification", 
+                           "mitochondrial membrane organization", 
+                           "meiotic cell cycle", 
+                           "oogenesis"),
+    P_Values = c(0, 0, 0.01, 0.01, 0.01, 0.01, 0.01, 0.02, 0.02, 0.03, 0.03, 0.03, 0.04, 0.04, 0.04),
+    Gene_Count = c(11, 11, 8, 17, 29, 6, 8, 7, 11, 9, 21, 10, 9, 14, 7),
+    Up = c(72.73, 81.82, 87.5, 17.65, 65.52, 100, 87.5, 14.29, 54.55, 88.89, 71.43, 80, 77.78, 7.14, 0),
+    Down = c(27.27, 18.18, 12.5, 82.35, 34.48, 0, 12.5, 85.71, 45.45, 11.11, 28.57, 20, 22.22, 92.86, 100)
+)
+
+# Replace p-value 0 with 1e-10 for -log10 transformation
+data$P_Values[data$P_Values == 0] <- 1e-10
+
+# Prepare data for plotting
+plot_data <- data %>%
+    mutate(
+        # Create transformed x-values
+        x = -log10(P_Values),
+        # Order processes by significance (most significant last)
+        y = reorder(Biological_Process, -log10(P_Values)),
+        # Calculate radius proportional to sqrt(Gene_Count)
+        radius = 0.07 * sqrt(Gene_Count)
+    ) %>%
+    # Convert to numeric position for y-axis
+    mutate(y_numeric = as.numeric(y))
+
+# Wrap long process names for y-axis labels
+n_levels <- nlevels(plot_data$y)
+levels(plot_data$y) <- str_wrap(levels(plot_data$y), width = 30)
+
+# Generate the plot
+ggplot() +
+    # Add pie charts
+    geom_scatterpie(
+        aes(x = x, y = y_numeric, r = radius),
+        data = plot_data,
+        cols = c("Up", "Down"),
+        color = NA  # Remove pie borders
+    ) +
+    # Set fill colors and legend labels
+    scale_fill_manual(
+        values = c("Up" = "#FF0000", "Down" = "#0000FF"),
+        name = "Expression",
+        labels = c("F₁ × GL > F₁ × Pi", "F₁ × GL < F₁ × Pi")
+    ) +
+    # Configure y-axis
+    scale_y_continuous(
+        breaks = 1:n_levels,
+        labels = levels(plot_data$y),
+        expand = expansion(add = 0.5)
+    ) +
+    # Set coordinate limits to avoid clipping
+    coord_cartesian(ylim = c(0.5, n_levels + 0.5)) +
+    # Axis labels and theme
+    labs(x = "-log₁₀(P-Value)") +
+    theme_bw() +
+    theme(
+        axis.title.y = element_blank(),  # Remove y-axis title
+        axis.text.y = element_text(
+            size = 8, 
+            hjust = 1, 
+            margin = margin(r = 10)  # Right margin for labels
+        ),
+        plot.margin = unit(c(1, 1, 1, 3), "cm"),  # Adjust margins (top, right, bottom, left)
+        legend.position = "bottom"
+    )
+  
+
+
+```
+
+
+
+
+
